@@ -94,6 +94,11 @@ fn exchange(client: &Client, url: &str, query: &[u8]) -> Result<Vec<u8>, String>
     Ok(body)
 }
 
+/// Start the system-DNS candidate only after the pinned bootstrap addresses
+/// stayed silent for this long. A healthy bootstrap keeps priority and the
+/// endpoint name is not leaked to the system resolver on every query.
+const SYSTEM_DNS_DELAY: Duration = Duration::from_millis(750);
+
 pub fn query(provider: &DohProvider, query: &[u8], if_index: u32) -> Result<Vec<u8>, String> {
     let source = source_address(if_index)?;
     let candidates: Vec<_> = if provider.bootstrap.is_empty() {
@@ -111,25 +116,72 @@ pub fn query(provider: &DohProvider, query: &[u8], if_index: u32) -> Result<Vec<
     };
     let (tx, rx) = std::sync::mpsc::channel();
     // Race complete DNS exchanges, not TCP connects: a silent TLS peer cannot consume the other address's budget.
-    for candidate in candidates {
-        let tx = tx.clone();
-        let query = query.to_vec();
-        std::thread::spawn(move || {
-            let result = http_client(&candidate, source)
-                .and_then(|client| exchange(&client, &candidate.url, &query));
-            let _ = tx.send(result);
-        });
+    for candidate in &candidates {
+        spawn_exchange(&tx, candidate, query, source);
     }
-    drop(tx);
+    // A retired bootstrap address must not disable a healthy DoH endpoint.
+    // Starting this candidate in the same race keeps the answer inside the
+    // caller's provider budget instead of spending it on the dead addresses.
+    let mut system = provider.clone();
+    system.bootstrap.clear();
+    let mut system_started = provider.bootstrap.is_empty();
+    let mut tx = Some(tx);
+    if system_started {
+        // No fallback to schedule: let the race end as soon as every attempt failed.
+        drop(tx.take());
+    }
     let deadline = Instant::now() + TIMEOUT + Duration::from_millis(100);
+    let bootstrap_delay = Instant::now() + SYSTEM_DNS_DELAY;
+    let mut bootstrap_error = None;
     let mut error = "DoH: deadline expired".to_string();
-    while let Ok(result) = rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-        match result {
-            Ok(answer) => return Ok(answer),
-            Err(e) => error = e,
+    loop {
+        let until = if system_started {
+            deadline
+        } else {
+            deadline.min(bootstrap_delay)
+        };
+        match rx.recv_timeout(until.saturating_duration_since(Instant::now())) {
+            Ok(Ok(answer)) => return Ok(answer),
+            Ok(Err(failure)) => {
+                if !system_started {
+                    bootstrap_error = Some(failure.clone());
+                }
+                error = failure;
+            }
+            Err(_) if !system_started => {
+                spawn_exchange(
+                    tx.as_ref().expect("sender kept until fallback"),
+                    &system,
+                    query,
+                    source,
+                );
+                system_started = true;
+                // From here only the running attempts may keep the race open.
+                drop(tx.take());
+            }
+            Err(_) => break,
         }
     }
-    Err(error)
+    match bootstrap_error {
+        Some(first) if first != error => Err(format!("{first}; через системный DNS: {error}")),
+        _ => Err(error),
+    }
+}
+
+fn spawn_exchange(
+    tx: &std::sync::mpsc::Sender<Result<Vec<u8>, String>>,
+    provider: &DohProvider,
+    query: &[u8],
+    source: Option<IpAddr>,
+) {
+    let tx = tx.clone();
+    let provider = provider.clone();
+    let query = query.to_vec();
+    std::thread::spawn(move || {
+        let result = http_client(&provider, source)
+            .and_then(|client| exchange(&client, &provider.url, &query));
+        let _ = tx.send(result);
+    });
 }
 
 fn validate_answer(

@@ -4,7 +4,7 @@
 //! No scheduled rescans or model-response measurements.
 
 use std::fs;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -79,9 +79,53 @@ pub fn discover_agent(if_index: u32) -> Result<Vec<RankedHost>, String> {
         ranked.push(RankedHost { host, ips });
     }
     if ranked.iter().all(|h| h.ips.is_empty()) {
-        return Err("Нет проверенных маршрутов; прежние hosts и рейтинг сохранены".into());
+        // hosts takes precedence over NRPT, so a pin left from a previous run
+        // keeps Antigravity broken even when every current probe failed.
+        return Err(match release_dead_pins() {
+            Ok(true) => {
+                "Нет проверенных маршрутов; закреплённые адреса не отвечают и убраны из hosts — используется DNS без привязки к IP".into()
+            }
+            Ok(false) => "Нет проверенных маршрутов; прежние hosts и рейтинг сохранены".into(),
+            Err(failure) => format!(
+                "Нет проверенных маршрутов; прежние hosts и рейтинг сохранены, освободить закреплённые адреса не удалось: {failure}"
+            ),
+        });
     }
     Ok(ranked)
+}
+
+/// Release the installed hosts block only when every pinned address failed both
+/// probes. A single answering pin is a working configuration and stays as is.
+fn release_dead_pins() -> Result<bool, String> {
+    let entries = crate::net::hosts::owned_entries()?;
+    let dead = pins_unreachable(&entries, |host, ip| {
+        crate::net::health::probe_ip(SocketAddr::new(IpAddr::V4(ip), 443), host)
+    });
+    if dead {
+        crate::net::hosts::remove_entries()?;
+    }
+    Ok(dead)
+}
+
+fn pins_unreachable(
+    entries: &[(String, Ipv4Addr)],
+    probe: impl Fn(&str, Ipv4Addr) -> Result<u128, String> + Sync,
+) -> bool {
+    if entries.is_empty() {
+        return false;
+    }
+    // Probe every pin concurrently so a fully dead block costs two budgets,
+    // not one budget per pinned host.
+    std::thread::scope(|scope| {
+        let jobs: Vec<_> = entries
+            .iter()
+            .map(|(host, ip)| {
+                let probe = &probe;
+                scope.spawn(move || (0..2).all(|_| probe(host, *ip).is_err()))
+            })
+            .collect();
+        jobs.into_iter().all(|job| job.join().unwrap_or(false))
+    })
 }
 
 pub fn apply_ranked(ranked: &[RankedHost]) -> Result<(), String> {
@@ -180,4 +224,69 @@ fn load() -> Vec<RankedHost> {
         }
     }
     ranked
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex,
+    };
+
+    fn entries(pairs: &[(&str, &str)]) -> Vec<(String, Ipv4Addr)> {
+        pairs
+            .iter()
+            .map(|(host, ip)| ((*host).to_string(), ip.parse().unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn no_pins_are_never_released() {
+        assert!(!pins_unreachable(&[], |_, _| -> Result<u128, String> {
+            panic!("probe must not run without pinned entries")
+        }));
+    }
+
+    #[test]
+    fn every_pin_must_fail_twice_before_release() {
+        let pinned = entries(&[("cloudcode-pa.googleapis.com", "192.0.2.1")]);
+        let probes = AtomicUsize::new(0);
+        assert!(pins_unreachable(&pinned, |_, _| {
+            probes.fetch_add(1, Ordering::Relaxed);
+            Err("TLS: reset".into())
+        }));
+        assert_eq!(probes.load(Ordering::Relaxed), 2);
+
+        let probes = AtomicUsize::new(0);
+        assert!(!pins_unreachable(&pinned, |_, _| {
+            probes.fetch_add(1, Ordering::Relaxed);
+            Ok(12)
+        }));
+        assert_eq!(probes.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn one_responding_pin_keeps_the_working_block() {
+        let pinned = entries(&[
+            ("cloudcode-pa.googleapis.com", "192.0.2.1"),
+            ("generativelanguage.googleapis.com", "192.0.2.2"),
+        ]);
+        let attempts = Mutex::new(std::collections::HashMap::new());
+        let dead = pins_unreachable(&pinned, |host, _| {
+            let mut attempts = attempts.lock().unwrap();
+            let attempt = attempts.entry(host.to_string()).or_insert(0);
+            *attempt += 1;
+            if host == "generativelanguage.googleapis.com" && *attempt == 2 {
+                Ok(40)
+            } else {
+                Err("TLS: reset".into())
+            }
+        });
+        assert!(!dead);
+        let attempts = attempts.into_inner().unwrap();
+        assert_eq!(attempts["cloudcode-pa.googleapis.com"], 2);
+        // A transient first failure is retried instead of releasing the pin.
+        assert_eq!(attempts["generativelanguage.googleapis.com"], 2);
+    }
 }

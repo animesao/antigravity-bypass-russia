@@ -33,13 +33,15 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             // HTTPS hostname verification still applies to every bootstrap IP.
+            // Keep these in sync with the current A records of dns.dns-ai.ru:
+            // the endpoint is HTTP/2-only, so a retired address fails the
+            // whole provider even though the service itself is healthy.
             doh: vec![DohProvider {
                 name: "dns-ai.ru".into(),
                 url: "https://dns.dns-ai.ru/dns-query".into(),
                 bootstrap: vec![
-                    "192.144.59.14".parse().unwrap(),
-                    "186.246.49.127".parse().unwrap(),
-                    "94.232.43.149".parse().unwrap(),
+                    "45.151.102.219".parse().unwrap(),
+                    "194.87.196.13".parse().unwrap(),
                 ],
             }],
             extra_udp: vec![],
@@ -186,18 +188,22 @@ pub fn load() -> Result<Config, String> {
 }
 
 // Old network.json files contain the previous defaults explicitly. Upgrade only
-// that exact bootstrap list; custom endpoints/address lists remain user-owned.
+// those exact bootstrap lists; custom endpoints/address lists remain user-owned.
 fn upgrade_builtin_defaults(config: &mut Config) {
-    let previous: Vec<IpAddr> = ["192.144.59.14", "186.246.49.127"]
-        .iter()
-        .map(|ip| ip.parse().unwrap())
-        .collect();
+    let current = Config::default().doh[0].bootstrap.clone();
+    let legacy: Vec<Vec<IpAddr>> = [
+        &["192.144.59.14", "186.246.49.127"][..],
+        &["192.144.59.14", "186.246.49.127", "94.232.43.149"][..],
+    ]
+    .iter()
+    .map(|list| list.iter().map(|ip| ip.parse().unwrap()).collect())
+    .collect();
     for provider in &mut config.doh {
         if provider.name == "dns-ai.ru"
             && provider.url == "https://dns.dns-ai.ru/dns-query"
-            && provider.bootstrap == previous
+            && legacy.contains(&provider.bootstrap)
         {
-            provider.bootstrap.push("94.232.43.149".parse().unwrap());
+            provider.bootstrap = current.clone();
         }
     }
     let custom_xbox = config.extra_udp.iter().any(|p| p.name == "xbox-dns.ru")
@@ -283,6 +289,22 @@ mod tests {
     use super::*;
     #[test]
     fn old_provider_settings_upgrade_without_resetting_user_choices() {
+        for previous in [
+            serde_json::json!(["192.144.59.14", "186.246.49.127"]),
+            serde_json::json!(["192.144.59.14", "186.246.49.127", "94.232.43.149"]),
+        ] {
+            let mut config: Config = serde_json::from_value(serde_json::json!({
+                "doh": [{"name": "dns-ai.ru", "url": "https://dns.dns-ai.ru/dns-query", "bootstrap": previous}],
+                "provider_order": ["xbox-dns.ru", "comss.one"],
+                "disabled_providers": ["xbox-dns.ru"],
+                "watch_region_errors": false
+            })).unwrap();
+            upgrade_builtin_defaults(&mut config);
+            assert_eq!(config.doh[0].bootstrap, Config::default().doh[0].bootstrap);
+            let upgraded = serde_json::to_value(&config).unwrap();
+            upgrade_builtin_defaults(&mut config);
+            assert_eq!(upgraded, serde_json::to_value(&config).unwrap());
+        }
         let mut config: Config = serde_json::from_value(serde_json::json!({
             "doh": [{"name": "dns-ai.ru", "url": "https://dns.dns-ai.ru/dns-query", "bootstrap": ["192.144.59.14", "186.246.49.127"]}],
             "provider_order": ["xbox-dns.ru", "comss.one"],
@@ -290,7 +312,6 @@ mod tests {
             "watch_region_errors": false
         })).unwrap();
         upgrade_builtin_defaults(&mut config);
-        assert_eq!(config.doh[0].bootstrap, Config::default().doh[0].bootstrap);
         assert!(!config.watch_region_errors);
         assert!(config.disabled_providers.is_empty());
         let pool = super::super::resolver_pool::from_config(&config).unwrap();
@@ -298,9 +319,6 @@ mod tests {
             pool.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
             ["dns-ai.ru", "comss.one", "geohide.ru"]
         );
-        let upgraded = serde_json::to_value(&config).unwrap();
-        upgrade_builtin_defaults(&mut config);
-        assert_eq!(upgraded, serde_json::to_value(&config).unwrap());
         config.provider_order = vec!["geohide.ru".into(), "dns-ai.ru".into()];
         let pool = super::super::resolver_pool::from_config(&config).unwrap();
         assert_eq!(
@@ -335,6 +353,16 @@ mod tests {
         ];
         upgrade_builtin_defaults(&mut config);
         assert_eq!(config.doh[0].bootstrap.len(), 2);
+        // A list the user edited is custom even when it starts from the old defaults.
+        config.doh[0].url = "https://dns.dns-ai.ru/dns-query".into();
+        config.doh[0].bootstrap = vec![
+            "192.144.59.14".parse().unwrap(),
+            "186.246.49.127".parse().unwrap(),
+            "94.232.43.149".parse().unwrap(),
+            "192.0.2.7".parse().unwrap(),
+        ];
+        upgrade_builtin_defaults(&mut config);
+        assert_eq!(config.doh[0].bootstrap.len(), 4);
     }
 
     #[test]
