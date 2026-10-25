@@ -35,12 +35,14 @@ assert bash and Path(bash).is_file(), "Bash is required"
 with tempfile.TemporaryDirectory(prefix="ag source bundle ") as temporary:
     root = Path(temporary)
     launcher = root / "unlock_and_restore.sh"
-    launcher.write_text(script, encoding="utf-8", newline="\n")
+    subprocess.run([sys.executable, str(ROOT / "scripts/bundle_macos_sources.py"),
+                    "--output", str(launcher)], check=True, timeout=10)
+    assert launcher.read_bytes() == script.encode("utf-8")
     subprocess.run([bash, "-n", str(launcher)], check=True, timeout=10)
     tools = root / "Rust toolchain" / "bin"
     tools.mkdir(parents=True)
     cargo = tools / "cargo"
-    cargo.write_text(r'''#!/bin/bash
+    cargo.write_bytes(r'''#!/bin/bash
 set -euo pipefail
 [[ "$#" == 9 && "$1" == build && "$2" == --release && "$3" == --locked && "$4" == --bin && "$5" == antigravity-bypass-russia && "$6" == --manifest-path && "$8" == --target-dir ]] || exit 92
 [[ -f "$7" && -f "$(dirname -- "$7")/src/system/guarded_io.rs" ]] || exit 93
@@ -53,10 +55,10 @@ printf '%s\n' "$@"
 exit 7
 ENGINE
 chmod +x "$9/release/antigravity-bypass-russia"
-''', encoding="utf-8", newline="\n")
+'''.encode("utf-8"))
     cargo.chmod(0o755)
     environment = root / "environment.sh"
-    environment.write_text(r'''uname() { if [[ "$1" == -s ]]; then echo "$ABR_OS"; else echo "$ABR_ARCH"; fi; }
+    environment.write_bytes(r'''uname() { if [[ "$1" == -s ]]; then echo "$ABR_OS"; else echo "$ABR_ARCH"; fi; }
 id() { if [[ "$1" == -u ]]; then echo "$ABR_UID"; else command id "$@"; fi; }
 xcode-select() { [[ "$1" == -p && "$ABR_XCODE" == 1 ]]; }
 exec() {
@@ -69,7 +71,7 @@ exec() {
   "$@"
   exit $?
 }
-''', encoding="utf-8", newline="\n")
+'''.encode("utf-8"))
     if sys.platform != "darwin":
         with environment.open("a", encoding="utf-8") as out:
             out.write("base64() { command base64 -d; }\nshasum() { command sha256sum; }\n")
@@ -88,7 +90,7 @@ exec() {
         # Construct the argument boundary inside Bash. Git Bash's additional
         # Windows command-line translation mangles empty/quoted arguments.
         invocation = root / "invoke.sh"
-        invocation.write_text("exec /bin/bash " + " ".join(shlex.quote(value) for value in [path.as_posix(), *arguments]) + "\n", encoding="utf-8", newline="\n")
+        invocation.write_bytes(("exec /bin/bash " + " ".join(shlex.quote(value) for value in [path.as_posix(), *arguments]) + "\n").encode("utf-8"))
         return subprocess.run([bash, str(invocation)], env=environment, capture_output=True,
                               encoding="utf-8", timeout=30)
 
@@ -103,7 +105,7 @@ exec() {
         print(f"PASS: {arch}, exact argument forwarding, user build and verified cache reuse")
         engine = next(path for path in home.rglob("antigravity-bypass-russia")
                       if path.is_file() and path.parent.name == arch)
-        engine.write_text("#!/bin/bash\nexit 99\n", encoding="utf-8", newline="\n")
+        engine.write_bytes(b"#!/bin/bash\nexit 99\n")
         repaired = run(current)
         assert repaired.returncode == 7 and repaired.stdout.splitlines() == arguments, repaired
         assert (home / "build.log").read_text().splitlines() == ["501", "501"]
@@ -132,7 +134,7 @@ exec() {
 
     corrupted = root / "corrupt.sh"
     bad = ("A" if encoded[0] != "A" else "B") + encoded[1:]
-    corrupted.write_text(script.replace(encoded, bad), encoding="utf-8", newline="\n")
+    corrupted.write_bytes(script.replace(encoded, bad).encode("utf-8"))
     home = root / "corrupt payload"
     result = run(env(home), corrupted)
     assert result.returncode == 1 and "повреждены" in result.stderr and not (home / "build.log").exists(), result

@@ -177,7 +177,7 @@ pub fn find_installations() -> Vec<PathBuf> {
         ];
         for c in candidates {
             let p = expand_env_vars(c);
-            if p.exists() && !installs.contains(&p) {
+            if p.is_dir() && !installs.contains(&p) {
                 installs.push(p);
             }
         }
@@ -232,7 +232,7 @@ pub fn find_installations() -> Vec<PathBuf> {
         ];
         for c in candidates {
             let p = expand_env_vars(c);
-            if p.exists() && !installs.contains(&p) {
+            if p.is_dir() && !installs.contains(&p) {
                 installs.push(p);
             }
         }
@@ -301,10 +301,46 @@ pub fn recover_installations() -> Result<(), String> {
 }
 
 fn recover_cli_in_dirs(dirs: &[PathBuf]) -> Result<(), String> {
+    let mut visited = std::collections::HashSet::new();
     for dir in dirs {
-        recover_directory(dir, 0, 0, None, true)?;
+        // PATH is a list of optional search roots, including symlinked bin
+        // directories. Resolve the root once; do not follow links recursively.
+        let resolved = match std::fs::canonicalize(dir) {
+            Ok(resolved) => resolved,
+            Err(error) if unavailable_cli_search_root(&error) => continue,
+            Err(error) => return Err(format!("Проверка каталога PATH {}: {error}", dir.display())),
+        };
+        if visited.insert(resolved.clone()) {
+            recover_directory(&resolved, 0, 0, None, true)?;
+        }
     }
     Ok(())
+}
+
+fn unavailable_cli_search_root(error: &std::io::Error) -> bool {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound
+            | std::io::ErrorKind::NotADirectory
+            | std::io::ErrorKind::InvalidInput
+    ) {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{
+            ERROR_BAD_PATHNAME, ERROR_FILENAME_EXCED_RANGE, ERROR_INVALID_NAME,
+        };
+        if error.raw_os_error().is_some_and(|code| {
+            matches!(
+                code as u32,
+                ERROR_INVALID_NAME | ERROR_BAD_PATHNAME | ERROR_FILENAME_EXCED_RANGE
+            )
+        }) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Restore claimed files before target discovery, including an explicit path
@@ -361,6 +397,9 @@ fn recover_directory(
     let entries = match std::fs::read_dir(directory) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        // PATH may contain a file (e.g. dotnet.exe) or a path beneath one.
+        // Skip invalid CLI search roots without hiding other recovery failures.
+        Err(error) if cli_only && unavailable_cli_search_root(&error) => return Ok(()),
         Err(error) => return Err(format!("{}: {error}", directory.display())),
     };
     for entry in entries {
@@ -875,6 +914,122 @@ mod detection_tests {
         std::fs::remove_file(&path).unwrap();
         recover_cli_in_dirs(&[root.path().into()]).unwrap();
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn path_recovery_skips_files_and_invalid_directories_and_still_recovers_cli() {
+        let root = tempfile::tempdir().unwrap();
+        let dotnet = root
+            .path()
+            .join("Program Files")
+            .join("dotnet")
+            .join("dotnet.exe");
+        std::fs::create_dir_all(dotnet.parent().unwrap()).unwrap();
+        let unrelated = b"unrelated executable must stay unchanged";
+        std::fs::write(&dotnet, unrelated).unwrap();
+        let cli_dir = root.path().join("valid CLI directory");
+        std::fs::create_dir(&cli_dir).unwrap();
+        let cli = cli_dir.join("agy.exe");
+        let original = cli_fixture(true, false);
+        pending_fixture(&cli, &original);
+
+        let search_dirs = vec![
+            dotnet.clone(),
+            dotnet.join("not-a-directory"),
+            root.path().join("missing directory"),
+            cli_dir.clone(),
+        ];
+        recover_cli_in_dirs(&search_dirs).unwrap();
+        assert_eq!(std::fs::read(&dotnet).unwrap(), unrelated);
+        assert_eq!(std::fs::read(&cli).unwrap(), original);
+        assert_eq!(
+            cli_files_in_dirs(&search_dirs),
+            vec![std::fs::canonicalize(cli).unwrap()]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn malformed_path_entries_do_not_block_recovery_in_a_later_valid_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let cli_dir = root.path().join("CLI с пробелами");
+        std::fs::create_dir(&cli_dir).unwrap();
+        let cli = cli_dir.join("agy.exe");
+        let original = cli_fixture(true, false);
+        pending_fixture(&cli, &original);
+        let malformed = root.path().join("bad<path>");
+        recover_cli_in_dirs(&[
+            malformed.clone(),
+            root.path().join("x".repeat(300)),
+            cli_dir,
+        ])
+        .unwrap();
+        assert_eq!(std::fs::read(cli).unwrap(), original);
+        // A user-selected invalid target remains an error; this tolerance is
+        // limited to optional search roots, not writes or rollback failures.
+        assert!(recover_targets_in_path(&malformed).is_err());
+    }
+
+    #[test]
+    fn search_root_tolerance_does_not_hide_access_or_recovery_failures() {
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::InvalidData,
+            std::io::ErrorKind::Other,
+        ] {
+            assert!(
+                !unavailable_cli_search_root(&std::io::Error::from(kind)),
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn interrupted_cli_is_recovered_through_a_linked_path_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real bin");
+        std::fs::create_dir(&real).unwrap();
+        let link = root.path().join("linked bin");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        #[cfg(windows)]
+        {
+            let output = crate::system::powershell::command().unwrap()
+                .args(["-NoProfile", "-NonInteractive", "-Command", "New-Item -ItemType Junction -Path $env:ABR_TEST_PATH_LINK -Target $env:ABR_TEST_PATH_REAL -ErrorAction Stop | Out-Null"])
+                .env("ABR_TEST_PATH_LINK", &link).env("ABR_TEST_PATH_REAL", &real).output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let cli = real.join("agy");
+        let original = cli_fixture(true, false);
+        pending_fixture(&cli, &original);
+        recover_cli_in_dirs(&[link.clone()]).unwrap();
+        assert_eq!(std::fs::read(&cli).unwrap(), original);
+        assert_eq!(
+            cli_files_in_dirs(&[link.clone()]),
+            vec![std::fs::canonicalize(cli).unwrap()]
+        );
+        #[cfg(unix)]
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            assert_ne!(
+                std::fs::symlink_metadata(&link).unwrap().file_attributes() & 0x400,
+                0
+            );
+        }
+        assert_eq!(
+            std::fs::canonicalize(link).unwrap(),
+            std::fs::canonicalize(real).unwrap()
+        );
     }
 
     #[test]

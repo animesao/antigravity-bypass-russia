@@ -511,6 +511,10 @@ pub fn enable() -> Result<(), String> {
 
     #[cfg(target_os = "windows")]
     {
+        // A worker is a separate process: updating iface.conf/network-user.json
+        // cannot invalidate its in-memory caches. Restart on every successful
+        // setup, including when the executable bytes have not changed.
+        stop_windows_worker()?;
         let task_xml = windows_task_xml(&dst);
 
         let xml_path = dir.join("task.xml");
@@ -633,6 +637,21 @@ pub fn enable() -> Result<(), String> {
     }
 
     Ok(())
+}
+
+#[cfg(windows)]
+fn stop_windows_worker() -> Result<(), String> {
+    let _ = crate::system::command::output("schtasks", ["/End", "/TN", TASK_NAME]);
+    if running_state()? {
+        crate::system::process::stop_process_by_name(EXE_NAME);
+    }
+    for _ in 0..20 {
+        if !running_state()? {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    Err("Прежняя DNS-служба ещё работает; повторный запуск отменён".into())
 }
 
 pub fn start() -> Result<(), String> {

@@ -2,6 +2,7 @@ use super::route_health::{self, Key};
 use native_tls::{TlsConnector, TlsStream};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 pub const PROBE_BUDGET: Duration = Duration::from_millis(2500);
@@ -19,6 +20,9 @@ fn probe_with_connector(
     deadline: Instant,
     connector: &TlsConnector,
 ) -> Result<u16, String> {
+    if Instant::now() >= deadline {
+        return Err("TLS: общий срок проверки истёк".into());
+    }
     stream.set_nonblocking(true).map_err(|e| e.to_string())?;
     let mut handshake = connector.connect(host, stream);
     let mut tls = loop {
@@ -181,28 +185,72 @@ fn read_http_status(reader: &mut impl Read) -> Result<u16, String> {
     Err("HTTP: header exceeds 16 KiB".into())
 }
 
+const DIAGNOSTIC_BUDGET: Duration = Duration::from_secs(4);
+
 pub fn probe_host(host: &str) -> ConnReport {
+    probe_hosts(&[host]).remove(0)
+}
+
+pub fn probe_all() -> Vec<ConnReport> {
+    probe_hosts(super::provider::NRPT_AGENT)
+}
+
+fn probe_hosts(hosts: &[&str]) -> Vec<ConnReport> {
+    probe_hosts_with(
+        hosts,
+        DIAGNOSTIC_BUDGET,
+        |host| {
+            (host, 443)
+                .to_socket_addrs()
+                .map(|addresses| addresses.collect())
+                .map_err(|error| format!("DNS: {error}"))
+        },
+        probe_address,
+    )
+}
+
+fn probe_until(
+    host: &str,
+    started: Instant,
+    deadline: Instant,
+    resolve: &impl Fn(&str) -> Result<Vec<SocketAddr>, String>,
+    probe: &impl Fn(SocketAddr, &str, Instant) -> Result<u16, String>,
+    resolved: impl Fn(Vec<String>),
+) -> ConnReport {
     let mut report = ConnReport {
         host: host.into(),
         ..Default::default()
     };
-    let start = Instant::now();
-    let addrs: Vec<_> = match (host, 443).to_socket_addrs() {
-        Ok(a) => a.collect(),
-        Err(e) => {
-            report.error = Some(format!("DNS: {e}"));
+    if Instant::now() >= deadline {
+        report.error = Some("DNS: общий срок проверки истёк".into());
+        return report;
+    }
+    let addrs = match resolve(host) {
+        Ok(addresses) => addresses,
+        Err(error) => {
+            report.error = Some(error);
             return report;
         }
     };
     report.resolved = addrs.iter().map(|a| a.ip().to_string()).collect();
+    resolved(report.resolved.clone());
+    // A platform lookup may finish after its caller has timed out. It must not
+    // start a late TCP/TLS connection or extend the original shared deadline.
+    if Instant::now() >= deadline {
+        report.error = Some("DNS: общий срок проверки истёк".into());
+        return report;
+    }
     let mut last_error = "DNS: нет A/AAAA".to_string();
     for addr in addrs {
-        // Share one deadline across every address and each byte of TLS/HTTP.
-        let result = probe_address(addr, host, start + Duration::from_secs(4));
+        if Instant::now() >= deadline {
+            last_error = "TCP/TLS/HTTP: общий срок проверки истёк".into();
+            break;
+        }
+        let result = probe(addr, host, deadline);
         match result {
             Ok(status) => {
                 report.http_status = Some(status);
-                report.latency_ms = start.elapsed().as_millis();
+                report.latency_ms = started.elapsed().as_millis();
                 report.connected = Some(addr.to_string());
                 report.used_ipv6 = addr.is_ipv6();
                 report.looks_like_google = super::resolvers::looks_google(&addr.ip());
@@ -218,26 +266,243 @@ pub fn probe_host(host: &str) -> ConnReport {
     report
 }
 
-pub fn probe_all() -> Vec<ConnReport> {
-    std::thread::scope(|scope| {
-        let jobs: Vec<_> = super::provider::NRPT_AGENT
-            .iter()
-            .map(|host| scope.spawn(move || probe_host(host)))
-            .collect();
-        jobs.into_iter()
-            .map(|j| {
-                j.join().unwrap_or_else(|_| ConnReport {
-                    error: Some("Проверка прервана".into()),
-                    ..Default::default()
-                })
+enum ProbeMessage {
+    Resolved(usize, Vec<String>),
+    Complete(usize, ConnReport),
+}
+
+/// getaddrinfo and platform trust-store calls cannot be cancelled portably.
+/// Workers may finish later, but collection never joins them or waits beyond
+/// this one deadline. Completed hosts and already resolved addresses are kept.
+fn probe_hosts_with(
+    hosts: &[&str],
+    budget: Duration,
+    resolve: impl Fn(&str) -> Result<Vec<SocketAddr>, String> + Send + Sync + 'static,
+    probe: impl Fn(SocketAddr, &str, Instant) -> Result<u16, String> + Send + Sync + 'static,
+) -> Vec<ConnReport> {
+    let started = Instant::now();
+    let deadline = started + budget;
+    let resolve = Arc::new(resolve);
+    let probe = Arc::new(probe);
+    let (tx, rx) = mpsc::channel();
+    let mut reports: Vec<_> = hosts
+        .iter()
+        .map(|host| ConnReport {
+            host: (*host).into(),
+            ..Default::default()
+        })
+        .collect();
+    let mut finished = vec![false; hosts.len()];
+    let mut remaining = hosts.len();
+    for (index, host) in hosts.iter().enumerate() {
+        if Instant::now() >= deadline {
+            break;
+        }
+        let host = (*host).to_owned();
+        let resolve = Arc::clone(&resolve);
+        let probe = Arc::clone(&probe);
+        let tx = tx.clone();
+        if let Err(error) = std::thread::Builder::new()
+            .name("antigravity-diagnostics".into())
+            .spawn(move || {
+                let report =
+                    probe_until(&host, started, deadline, &*resolve, &*probe, |addresses| {
+                        let _ = tx.send(ProbeMessage::Resolved(index, addresses));
+                    });
+                let _ = tx.send(ProbeMessage::Complete(index, report));
             })
-            .collect()
-    })
+        {
+            reports[index].error = Some(format!("Не удалось запустить проверку: {error}"));
+            finished[index] = true;
+            remaining -= 1;
+        }
+    }
+    drop(tx);
+    let mut interrupted = false;
+    while remaining > 0 {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        match rx.recv_timeout(left) {
+            Ok(ProbeMessage::Resolved(index, addresses)) => reports[index].resolved = addresses,
+            Ok(ProbeMessage::Complete(index, report)) => {
+                reports[index] = report;
+                finished[index] = true;
+                remaining -= 1;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => break,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                interrupted = true;
+                break;
+            }
+        }
+    }
+    for (report, finished) in reports.iter_mut().zip(finished) {
+        if !finished {
+            report.latency_ms = started.elapsed().as_millis();
+            report.error = Some(if interrupted {
+                "Проверка прервана".into()
+            } else if report.resolved.is_empty() {
+                "DNS: общий срок проверки истёк".into()
+            } else {
+                "TCP/TLS/HTTP: общий срок проверки истёк".into()
+            });
+        }
+    }
+    reports
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostic_deadline_keeps_fast_results_and_resolved_addresses_without_joining_stalled_workers(
+    ) {
+        let started = Instant::now();
+        let reports = probe_hosts_with(
+            &["slow-dns.invalid", "fast.invalid", "slow-tls.invalid"],
+            Duration::from_millis(80),
+            |host| {
+                if host == "slow-dns.invalid" {
+                    std::thread::sleep(Duration::from_millis(400));
+                }
+                Ok(vec!["192.0.2.1:443".parse().unwrap()])
+            },
+            |_, host, _| {
+                if host == "slow-tls.invalid" {
+                    std::thread::sleep(Duration::from_millis(400));
+                }
+                Ok(401)
+            },
+        );
+        assert!(started.elapsed() < Duration::from_millis(300));
+        assert_eq!(
+            reports.iter().map(|r| r.host.as_str()).collect::<Vec<_>>(),
+            ["slow-dns.invalid", "fast.invalid", "slow-tls.invalid"]
+        );
+        assert!(reports[0].error.as_ref().unwrap().starts_with("DNS:"));
+        assert!(reports[0].resolved.is_empty());
+        assert_eq!(reports[1].http_status, Some(401));
+        assert!(reports[1].error.is_none());
+        assert_eq!(reports[2].resolved, ["192.0.2.1"]);
+        assert!(reports[2]
+            .error
+            .as_ref()
+            .unwrap()
+            .starts_with("TCP/TLS/HTTP:"));
+    }
+
+    #[test]
+    fn diagnostics_do_not_start_tls_after_a_late_lookup_or_an_expired_address_budget() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = AtomicUsize::new(0);
+        let started = Instant::now();
+        let report = probe_until(
+            "late.invalid",
+            started,
+            started + Duration::from_millis(10),
+            &|_| {
+                std::thread::sleep(Duration::from_millis(30));
+                Ok(vec!["192.0.2.1:443".parse().unwrap()])
+            },
+            &|_, _, _| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(200)
+            },
+            |_| {},
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(report.error.unwrap().starts_with("DNS:"));
+
+        let started = Instant::now();
+        let report = probe_until(
+            "addresses.invalid",
+            started,
+            started + Duration::from_millis(10),
+            &|_| {
+                Ok(vec![
+                    "192.0.2.1:443".parse().unwrap(),
+                    "192.0.2.2:443".parse().unwrap(),
+                ])
+            },
+            &|_, _, _| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(30));
+                Err("TCP: timed out".into())
+            },
+            |_| {},
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(report.error.unwrap().contains("срок проверки истёк"));
+    }
+
+    #[test]
+    fn stalled_lookups_do_not_block_collection_and_zero_budget_starts_no_work() {
+        // Keep lookups blocked until collection has returned. The watchdog only
+        // detects a stuck collector; scheduler delays must not decide success.
+        let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let worker_gate = Arc::clone(&gate);
+        let (done_tx, done_rx) = mpsc::channel();
+        let collector = std::thread::spawn(move || {
+            let reports = probe_hosts_with(
+                &["one.invalid", "two.invalid", "three.invalid"],
+                Duration::from_millis(80),
+                move |_| {
+                    let (released, wake) = &*worker_gate;
+                    drop(
+                        wake.wait_while(released.lock().unwrap(), |ready| !*ready)
+                            .unwrap(),
+                    );
+                    Ok(vec![])
+                },
+                |_, _, _| panic!("An expired DNS lookup must not start TLS"),
+            );
+            let _ = done_tx.send(reports);
+        });
+        let result = done_rx.recv_timeout(Duration::from_secs(10));
+        // Release workers even on failure, so a broken implementation does not
+        // leave the test process waiting for its own fixture.
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        collector.join().unwrap();
+        let reports = result.expect("Collection must finish while DNS workers are blocked");
+        assert!(reports
+            .iter()
+            .all(|report| report.error.as_ref().unwrap().starts_with("DNS:")));
+        let reports = probe_hosts_with(
+            &["no-work.invalid"],
+            Duration::ZERO,
+            |_| panic!("No DNS without a remaining budget"),
+            |_, _, _| panic!("No TLS without a remaining budget"),
+        );
+        assert!(reports[0]
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("срок проверки истёк"));
+    }
+
+    #[test]
+    fn diagnostic_workers_receive_the_same_original_deadline() {
+        let deadlines = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let worker_deadlines = Arc::clone(&deadlines);
+        let reports = probe_hosts_with(
+            &["one.invalid", "two.invalid", "three.invalid"],
+            Duration::from_secs(10),
+            |_| Ok(vec!["192.0.2.1:443".parse().unwrap()]),
+            move |_, _, deadline| {
+                worker_deadlines.lock().unwrap().push(deadline);
+                Ok(401)
+            },
+        );
+        assert!(reports.iter().all(|report| report.http_status == Some(401)));
+        let deadlines = deadlines.lock().unwrap();
+        assert_eq!(deadlines.len(), reports.len());
+        assert!(deadlines.iter().all(|deadline| *deadline == deadlines[0]));
+    }
+
     // Generate a short-lived localhost identity for this test process only.
     // No OS trust changes, committed private key, or future expiry date to maintain.
     pub(crate) fn identity() -> &'static (Vec<u8>, Vec<u8>) {

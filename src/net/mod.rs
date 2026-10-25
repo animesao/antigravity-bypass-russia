@@ -1,4 +1,6 @@
 pub mod client;
+#[cfg(any(windows, test))]
+pub mod compatibility;
 pub mod config;
 pub mod dns_https;
 pub mod doh;
@@ -19,8 +21,13 @@ pub mod split_dns;
 
 pub use relay::{detach_console, log_fatal, run as run_dns_relay};
 
-use provider::{nrpt_domains, NRPT_AGENT, NRPT_STUDIO, NRPT_TAG, SUBSTITUTION_CANARIES};
+#[cfg(any(target_os = "macos", test))]
+use provider::nrpt_domains;
+#[cfg(windows)]
+use provider::NRPT_TAG;
+use provider::{NRPT_AGENT, NRPT_STUDIO, SUBSTITUTION_CANARIES};
 use relay::{LISTEN_IP, LISTEN_PORT};
+#[cfg(windows)]
 use routes::{add_static_routes, remove_static_routes};
 use std::thread;
 use std::time::Duration;
@@ -208,6 +215,106 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn compatibility_requires_the_specific_agent_host_but_not_for_a_studio_suffix() {
+        use super::*;
+        let inventory = nrpt::NrptInventory {
+            foreign_rules: vec![nrpt::ForeignRule {
+                id: "other-bypass".into(),
+                namespaces: vec![
+                    "DAILY-CLOUDCODE-PA.GOOGLEAPIS.COM.".into(),
+                    ".generativelanguage.googleapis.com".into(),
+                    "unrelated.test".into(),
+                ],
+                nameservers: vec!["192.0.2.53".into()],
+                display_name: "Existing DNS".into(),
+            }],
+            policy_present: false,
+        };
+        let desired = [
+            (
+                "daily-cloudcode-pa.googleapis.com".into(),
+                "127.0.0.53".into(),
+            ),
+            (
+                "generativelanguage.googleapis.com".into(),
+                "127.0.0.53".into(),
+            ),
+            (
+                ".generativelanguage.googleapis.com".into(),
+                "127.0.0.53".into(),
+            ),
+        ];
+        let plan = inventory.plan(&desired);
+        let coverage = compatibility_coverage(&plan, &[]);
+        assert_eq!(coverage.agent_hosts, ["daily-cloudcode-pa.googleapis.com"]);
+        assert!(coverage
+            .notes
+            .iter()
+            .any(|note| note.contains("Existing DNS") && note.contains("192.0.2.53")));
+        assert!(coverage
+            .notes
+            .iter()
+            .any(|note| note.contains("не подтверждён")));
+        assert!(coverage
+            .notes
+            .iter()
+            .all(|note| !note.contains("unrelated.test")));
+    }
+
+    #[test]
+    fn effective_override_and_domain_policy_require_agent_hosts_fallback() {
+        use super::*;
+        let desired: Vec<_> = NRPT_AGENT
+            .iter()
+            .map(|host| (host.to_string(), "127.0.0.53".into()))
+            .collect();
+        let mut inventory = nrpt::NrptInventory {
+            foreign_rules: vec![],
+            policy_present: false,
+        };
+        let plan = inventory.plan(&desired);
+        let coverage = compatibility_coverage(
+            &plan,
+            &[nrpt::EffectiveIssue {
+                namespace: "CLOUDCODE-PA.GOOGLEAPIS.COM.".into(),
+                reason: "Windows uses another DNS".into(),
+            }],
+        );
+        assert_eq!(coverage.agent_hosts, ["cloudcode-pa.googleapis.com"]);
+        inventory.policy_present = true;
+        assert_eq!(
+            compatibility_coverage(&inventory.plan(&desired), &[]).agent_hosts,
+            NRPT_AGENT
+        );
+    }
+
+    #[test]
+    fn late_foreign_dns_or_hosts_only_mode_preserves_system_doh() {
+        use super::*;
+        let clean = nrpt::NrptInventory::default();
+        let plan = clean.plan(&[("example.test".into(), "127.0.0.53".into())]);
+        assert!(may_disable_system_doh(&[&clean, &clean], &plan));
+        let policy = nrpt::NrptInventory {
+            foreign_rules: vec![],
+            policy_present: true,
+        };
+        assert!(!may_disable_system_doh(&[&clean, &policy], &plan));
+        let foreign = nrpt::NrptInventory {
+            foreign_rules: vec![nrpt::ForeignRule {
+                id: "late-vpn".into(),
+                namespaces: vec!["unrelated.test".into()],
+                nameservers: vec![],
+                display_name: String::new(),
+            }],
+            policy_present: false,
+        };
+        assert!(!may_disable_system_doh(&[&clean, &foreign], &plan));
+        assert!(!may_disable_system_doh(&[&foreign, &clean], &plan));
+        let hosts_only = clean.plan(&[("example.test".into(), String::new())]);
+        assert!(!may_disable_system_doh(&[&clean], &hosts_only));
+    }
 }
 
 pub fn preflight() -> Result<(), String> {
@@ -249,6 +356,90 @@ pub(super) fn flush_dns_cache() -> Result<(), String> {
 pub struct NetworkSetup {
     pub message: String,
     pub local_relay_running: bool,
+    pub hosts_fallback: bool,
+    pub compatibility_notes: Vec<String>,
+}
+
+#[cfg(any(windows, test))]
+struct CompatibilityCoverage {
+    agent_hosts: Vec<String>,
+    notes: Vec<String>,
+}
+
+#[cfg(any(windows, test))]
+fn compatibility_coverage(
+    plan: &nrpt::CompatibilityPlan,
+    issues: &[nrpt::EffectiveIssue],
+) -> CompatibilityCoverage {
+    let normalize = |name: &str| name.trim().trim_end_matches('.').to_ascii_lowercase();
+    let unavailable: std::collections::BTreeSet<_> = plan
+        .skipped
+        .iter()
+        .chain(issues.iter().map(|issue| &issue.namespace))
+        .map(|name| normalize(name))
+        .collect();
+    // Exact Agent rules are planned independently of Studio suffixes. A
+    // skipped suffix must not invalidate an effective exact Agent rule.
+    let agent_hosts: Vec<_> = NRPT_AGENT
+        .iter()
+        .filter(|host| unavailable.contains(**host))
+        .map(|host| (*host).to_string())
+        .collect();
+    let mut notes = Vec::new();
+    if plan.policy_present {
+        notes.push("Политика DNS Windows сохранена; локальные правила NRPT не добавлялись".into());
+    }
+    for rule in &plan.preserved {
+        let label = if rule.display_name.trim().is_empty() {
+            rule.id.as_str()
+        } else {
+            rule.display_name.as_str()
+        };
+        let domains: Vec<_> = rule
+            .namespaces
+            .iter()
+            .filter(|name| unavailable.contains(&normalize(name)))
+            .map(String::as_str)
+            .collect();
+        if !domains.is_empty() {
+            notes.push(format!(
+                "Сохранён DNS {}: {} → {}",
+                label,
+                domains.join(", "),
+                if rule.nameservers.is_empty() {
+                    "системные DNS".into()
+                } else {
+                    rule.nameservers.join(", ")
+                }
+            ));
+        }
+    }
+    let optional: Vec<_> = unavailable
+        .iter()
+        .filter(|name| !NRPT_AGENT.contains(&name.as_str()))
+        .cloned()
+        .collect();
+    if !optional.is_empty() {
+        notes.push(format!(
+            "Gemini/AI Studio: используются существующие настройки для {}; обход этих доменов не подтверждён",
+            optional.join(", ")
+        ));
+    }
+    for issue in issues {
+        notes.push(format!("DNS {}: {}", issue.namespace, issue.reason));
+    }
+    CompatibilityCoverage { agent_hosts, notes }
+}
+
+#[cfg(any(windows, test))]
+fn may_disable_system_doh(
+    inventories: &[&nrpt::NrptInventory],
+    plan: &nrpt::CompatibilityPlan,
+) -> bool {
+    !plan.rules.is_empty()
+        && inventories
+            .iter()
+            .all(|inventory| inventory.foreign_rules.is_empty() && !inventory.policy_present)
 }
 
 /// Serialize foreground setup and background OS/configuration writers. The DNS
@@ -299,15 +490,19 @@ pub fn apply_dns_rules() -> Result<NetworkSetup, String> {
     // Reconfigure owned rules in place. Removing the working service/hosts/DNS
     // before discovery left users disconnected whenever all probes failed.
 
-    let names = nrpt_domains();
     step("Проверяем настройки сети");
-    let conflicts = nrpt::conflicting_rules(&names)?;
-    if !conflicts.is_empty() {
-        return Err(format!(
-            "Конфликт NRPT: {}. Чужие правила сохранены.",
-            conflicts.join(", ")
-        ));
-    }
+    // Read before changing routes/service; unreadable rules are not evidence
+    // that DNS is safe to overwrite. Re-read before applying the final plan.
+    #[cfg(windows)]
+    let initial_inventory = nrpt::inventory()?;
+    #[cfg(windows)]
+    let mut compatibility_notes = Vec::new();
+    #[cfg(not(windows))]
+    let compatibility_notes = Vec::new();
+    #[cfg(windows)]
+    let hosts_fallback;
+    #[cfg(not(windows))]
+    let hosts_fallback = false;
 
     step("Определяем подключение к интернету");
     let egress = crate::net::egress::detect();
@@ -413,7 +608,12 @@ pub fn apply_dns_rules() -> Result<NetworkSetup, String> {
             "процесс запущен, но DNS-проверка не прошла; сохранены резервные адреса".into();
     }
     if !relay_ok && resolvers::fallback_v4().is_empty() {
+        #[cfg(not(windows))]
         return Err("Включены только DoH-провайдеры, но локальный DNS не запустился".into());
+        #[cfg(windows)]
+        compatibility_notes.push(
+            "Локальный DNS не запустился; подключение Antigravity проверяется через hosts".into(),
+        );
     }
     if !relay_ok && resolver_pool::load()?.iter().any(|p| p.kind() == "doh") {
         sub_notes.push(
@@ -425,27 +625,66 @@ pub fn apply_dns_rules() -> Result<NetworkSetup, String> {
         std::path::Path::new("/etc/resolver"),
         &assemble_dns_rules(&agent_rules, &studio_subs, relay_ok, true),
     )?;
+    #[cfg(windows)]
+    let (inventory, plan) = {
+        let rules = assemble_dns_rules(&agent_rules, &studio_subs, relay_ok, false);
+        let inventory = nrpt::inventory()?;
+        let plan = inventory.plan(&rules);
+        let coverage = compatibility_coverage(&plan, &[]);
+        // Reject a known uncovered Agent before replacing its working pins or
+        // removing an old owned NRPT rule during reconciliation.
+        compatibility::require_agent_pins(&coverage.agent_hosts, &ranked)?;
+        (inventory, plan)
+    };
     crate::net::rank::apply_ranked(&ranked)?;
-    crate::net::doh::disable_system_doh()?;
 
     // Keep verified agent addresses installed by apply_ranked. A VPN enabled
     // later may intercept loopback DNS even while the relay remains healthy.
 
     #[cfg(target_os = "windows")]
     {
-        let rules = assemble_dns_rules(&agent_rules, &studio_subs, relay_ok, false);
         step("Сохраняем настройки подключения");
-        let count = crate::net::nrpt::apply_nrpt_rules_direct(&rules, NRPT_TAG, "Antigravity DNS");
-        if count != rules.len() {
-            return Err(format!("NRPT: записано {count}/{} правил", rules.len()));
+        let plan = nrpt::apply_compatible_rules(&plan, NRPT_TAG, "Antigravity DNS")?;
+        let latest_inventory = nrpt::inventory()?;
+        // Foreign split-DNS often relies on system DoH policy. Hosts provides
+        // the Agent fallback without changing those global settings.
+        if may_disable_system_doh(&[&initial_inventory, &inventory, &latest_inventory], &plan) {
+            crate::net::doh::disable_system_doh()?;
+        } else {
+            compatibility_notes
+                .push("Существующие правила DNS и настройки системного DoH сохранены".into());
         }
-        crate::net::nrpt::verify_effective(&rules)?;
+        let issues = match nrpt::ineffective_namespaces(&plan.rules) {
+            Ok(issues) => issues,
+            Err(error) => plan
+                .rules
+                .iter()
+                .map(|(namespace, _)| nrpt::EffectiveIssue {
+                    namespace: namespace.clone(),
+                    reason: format!("проверка действующей политики недоступна: {error}"),
+                })
+                .collect(),
+        };
+        let coverage = compatibility_coverage(&plan, &issues);
+        hosts_fallback = !coverage.agent_hosts.is_empty();
+        flush_dns_cache()?;
+        if hosts_fallback {
+            step("Проверяем подключение Antigravity через hosts");
+            compatibility::verify_agent_pins(&coverage.agent_hosts, &ranked)?;
+            compatibility_notes.push(format!(
+                "Antigravity: проверен резервный путь через hosts для {}",
+                coverage.agent_hosts.join(", ")
+            ));
+        }
+        compatibility_notes.extend(coverage.notes);
     }
 
     #[cfg(target_os = "macos")]
     {
+        crate::net::doh::disable_system_doh()?;
         split_dns::apply(std::path::Path::new("/etc/resolver"), &rules)?;
     }
+    #[cfg(not(windows))]
     flush_dns_cache()?;
 
     let mut msg = if relay_ok {
@@ -461,9 +700,15 @@ pub fn apply_dns_rules() -> Result<NetworkSetup, String> {
         msg.push_str(" | ");
         msg.push_str(&sub_notes.join("; "));
     }
+    if !compatibility_notes.is_empty() {
+        msg.push_str(" | ");
+        msg.push_str(&compatibility_notes.join("; "));
+    }
     Ok(NetworkSetup {
         message: msg,
         local_relay_running: relay_ok,
+        hosts_fallback,
+        compatibility_notes,
     })
 }
 

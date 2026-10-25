@@ -110,7 +110,7 @@ def main():
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(bundle(source_archive()), encoding="utf-8", newline="\n")
+    args.output.write_bytes(bundle(source_archive()).encode("utf-8"))
     args.output.chmod(0o755)
     print(args.output.resolve())
 

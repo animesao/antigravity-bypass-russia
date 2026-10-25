@@ -24,11 +24,16 @@ pub fn hosts_path() -> PathBuf {
 }
 
 pub fn write_entries(entries: &[(String, Ipv4Addr)]) -> Result<(), String> {
-    let p = hosts_path();
-    let original = if p.exists() {
-        fs::read_to_string(&p).map_err(|e| format!("Чтение hosts: {}", e))?
-    } else {
-        String::new()
+    write_entries_at(&hosts_path(), entries)
+}
+
+fn write_entries_at(p: &Path, entries: &[(String, Ipv4Addr)]) -> Result<(), String> {
+    // Windows hosts can contain legacy-encoded comments. Only our ASCII block
+    // needs parsing; decoding the complete file would reject or change user bytes.
+    let original = match fs::read(p) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(format!("Чтение hosts: {e}")),
     };
 
     let stripped = strip_block(&original)?;
@@ -43,49 +48,66 @@ pub fn write_entries(entries: &[(String, Ipv4Addr)]) -> Result<(), String> {
 
     // Prepending needs no separator added to the user's bytes, even without
     // an existing final newline. Rollback removes exactly our complete block.
-    let combined = format!("{block}{stripped}");
+    let mut combined = block.into_bytes();
+    combined.extend_from_slice(&stripped);
     if combined == original {
         return Ok(());
     }
 
-    safe_write_hosts(&p, original.as_bytes(), combined.as_bytes())
+    safe_write_hosts(p, &original, &combined)
 }
 
 pub fn remove_entries() -> Result<(), String> {
-    let p = hosts_path();
-    if !p.exists() {
-        return Ok(());
-    }
-    let original = fs::read_to_string(&p).map_err(|e| format!("Чтение hosts: {}", e))?;
+    remove_entries_at(&hosts_path())
+}
+
+fn remove_entries_at(p: &Path) -> Result<(), String> {
+    let original = match fs::read(p) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("Чтение hosts: {e}")),
+    };
     let stripped = strip_block(&original)?;
     if stripped != original {
-        safe_write_hosts(&p, original.as_bytes(), stripped.as_bytes())?;
+        safe_write_hosts(p, &original, &stripped)?;
     }
     Ok(())
 }
 
 pub fn owned_entries() -> Result<Vec<(String, Ipv4Addr)>, String> {
-    match fs::read_to_string(hosts_path()) {
-        Ok(text) => parse_owned_entries(&text),
+    match fs::read(hosts_path()) {
+        Ok(bytes) => parse_owned_entries(&bytes),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(vec![]),
         Err(e) => Err(format!("Чтение hosts: {e}")),
     }
 }
 
-fn parse_owned_entries(text: &str) -> Result<Vec<(String, Ipv4Addr)>, String> {
+fn parse_owned_entries(text: &[u8]) -> Result<Vec<(String, Ipv4Addr)>, String> {
     strip_block(text)?; // Refuse damaged boundaries rather than guessing ownership.
     let mut entries = Vec::new();
     let mut inside = false;
-    for line in text.lines() {
-        match line.trim() {
-            START_MARK => inside = true,
-            END_MARK => inside = false,
+    for line in text.split(|byte| *byte == b'\n') {
+        match line.trim_ascii() {
+            marker if marker == START_MARK.as_bytes() => inside = true,
+            marker if marker == END_MARK.as_bytes() => inside = false,
             _ if inside => {
-                let mut fields = line.split('#').next().unwrap_or("").split_whitespace();
-                let Some(ip) = fields.next().and_then(|ip| ip.parse::<Ipv4Addr>().ok()) else {
+                let mut fields = line
+                    .split(|byte| *byte == b'#')
+                    .next()
+                    .unwrap_or_default()
+                    .split(|byte| byte.is_ascii_whitespace())
+                    .filter(|field| !field.is_empty());
+                let Some(ip) = fields
+                    .next()
+                    .and_then(|ip| std::str::from_utf8(ip).ok())
+                    .and_then(|ip| ip.parse::<Ipv4Addr>().ok())
+                else {
                     continue;
                 };
                 for host in fields {
+                    let Ok(host) = std::str::from_utf8(host) else {
+                        continue;
+                    };
                     let host = super::route_health::host_name(host);
                     if !super::provider::NRPT_AGENT.contains(&host.as_str()) {
                         continue;
@@ -107,17 +129,17 @@ fn parse_owned_entries(text: &str) -> Result<Vec<(String, Ipv4Addr)>, String> {
     Ok(entries)
 }
 
-fn strip_block(text: &str) -> Result<String, String> {
-    let mut result = String::new();
+fn strip_block(text: &[u8]) -> Result<Vec<u8>, String> {
+    let mut result = Vec::new();
     let mut in_block = false;
-    for line in text.split_inclusive('\n') {
-        match line.trim() {
-            START_MARK if !in_block => in_block = true,
-            END_MARK if in_block => in_block = false,
-            START_MARK | END_MARK => {
+    for line in text.split_inclusive(|byte| *byte == b'\n') {
+        match line.trim_ascii() {
+            marker if marker == START_MARK.as_bytes() && !in_block => in_block = true,
+            marker if marker == END_MARK.as_bytes() && in_block => in_block = false,
+            marker if marker == START_MARK.as_bytes() || marker == END_MARK.as_bytes() => {
                 return Err("Повреждены границы блока hosts; файл сохранён".into())
             }
-            _ if !in_block => result.push_str(line),
+            _ if !in_block => result.extend_from_slice(line),
             _ => {}
         }
     }
@@ -133,10 +155,12 @@ mod tests {
     #[test]
     fn only_unambiguous_owned_agent_entries_can_identify_a_refused_route() {
         let unmanaged = "192.0.2.9 cloudcode-pa.googleapis.com\n";
-        assert!(parse_owned_entries(unmanaged).unwrap().is_empty());
+        assert!(parse_owned_entries(unmanaged.as_bytes())
+            .unwrap()
+            .is_empty());
         let text = format!("{unmanaged}{START_MARK}\n192.0.2.1 CLOUDCODE-PA.GOOGLEAPIS.COM # keep\n192.0.2.2 unrelated.test\n{END_MARK}\n");
         assert_eq!(
-            parse_owned_entries(&text).unwrap(),
+            parse_owned_entries(text.as_bytes()).unwrap(),
             vec![(
                 "cloudcode-pa.googleapis.com".into(),
                 "192.0.2.1".parse().unwrap()
@@ -146,8 +170,8 @@ mod tests {
             END_MARK,
             &format!("192.0.2.3 cloudcode-pa.googleapis.com\n{END_MARK}"),
         );
-        assert!(parse_owned_entries(&conflicting).is_err());
-        assert!(parse_owned_entries(&text.replace(END_MARK, "")).is_err());
+        assert!(parse_owned_entries(conflicting.as_bytes()).is_err());
+        assert!(parse_owned_entries(text.replace(END_MARK, "").as_bytes()).is_err());
     }
 
     #[test]
@@ -166,11 +190,72 @@ mod tests {
             "",
         ] {
             let text = format!("{START_MARK}\n127.0.0.2 example.com\n{END_MARK}\n{original}");
-            assert_eq!(strip_block(&text).unwrap(), original);
-            assert_eq!(strip_block(original).unwrap(), original);
+            assert_eq!(strip_block(text.as_bytes()).unwrap(), original.as_bytes());
+            assert_eq!(
+                strip_block(original.as_bytes()).unwrap(),
+                original.as_bytes()
+            );
         }
-        assert!(strip_block(&format!("{START_MARK}\n# user lines")).is_err());
-        assert!(strip_block(END_MARK).is_err());
+        assert!(strip_block(format!("{START_MARK}\n# user lines").as_bytes()).is_err());
+        assert!(strip_block(END_MARK.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn legacy_encoded_hosts_roundtrip_and_preserve_later_user_additions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hosts");
+        // CP1251 Cyrillic, a CRLF line and no final newline must survive exactly.
+        let unmanaged = b"# \xcf\xf0\xee\xe2\xe5\xf0\xea\xe0\r\n127.0.0.1 localhost";
+        fs::write(&path, unmanaged).unwrap();
+        let entries = vec![(
+            "daily-cloudcode-pa.googleapis.com".into(),
+            "192.0.2.1".parse().unwrap(),
+        )];
+        write_entries_at(&path, &entries).unwrap();
+        let applied = fs::read(&path).unwrap();
+        assert!(applied.ends_with(unmanaged));
+        assert_eq!(parse_owned_entries(&applied).unwrap(), entries);
+        write_entries_at(&path, &entries).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), applied);
+
+        let addition = b"\r\n# \xe4\xee\xe1\xe0\xe2\xeb\xe5\xed\xee\r\n192.0.2.9 custom.test\r\n";
+        let mut later = applied;
+        later.extend_from_slice(addition);
+        fs::write(&path, later).unwrap();
+        remove_entries_at(&path).unwrap();
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            [unmanaged.as_slice(), addition.as_slice()].concat()
+        );
+        remove_entries_at(&path).unwrap();
+        assert!(parse_owned_entries(&fs::read(&path).unwrap())
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn damaged_boundaries_in_legacy_hosts_do_not_authorize_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hosts");
+        for marker in [START_MARK, END_MARK] {
+            let bytes = [
+                b"# \xcf\xf0\xee\xe2\xe5\xf0\xea\xe0\r\n".as_slice(),
+                marker.as_bytes(),
+            ]
+            .concat();
+            fs::write(&path, &bytes).unwrap();
+            assert!(write_entries_at(
+                &path,
+                &[(
+                    "cloudcode-pa.googleapis.com".into(),
+                    "192.0.2.1".parse().unwrap()
+                )]
+            )
+            .is_err());
+            assert!(remove_entries_at(&path).is_err());
+            assert!(parse_owned_entries(&bytes).is_err());
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
     }
 
     #[cfg(windows)]

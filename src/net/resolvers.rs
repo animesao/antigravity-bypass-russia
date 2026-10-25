@@ -326,6 +326,23 @@ fn collect_race(
     deadline: Instant,
     settle: Option<&Settle>,
 ) -> (Vec<RaceResult>, Vec<IpAddr>) {
+    collect_race_with(
+        |until| {
+            rx.recv_timeout(until.saturating_duration_since(Instant::now()))
+                .ok()
+        },
+        Instant::now,
+        deadline,
+        settle,
+    )
+}
+
+fn collect_race_with(
+    mut receive: impl FnMut(Instant) -> Option<RaceMsg>,
+    mut now: impl FnMut() -> Instant,
+    deadline: Instant,
+    settle: Option<&Settle>,
+) -> (Vec<RaceResult>, Vec<IpAddr>) {
     let mut hits = Vec::new();
     let mut reference = Vec::new();
     let mut done = Vec::new();
@@ -333,7 +350,7 @@ fn collect_race(
     // A fast passthrough must not hide a slower substituting provider.
     loop {
         let until = grace.map_or(deadline, |g| g.min(deadline));
-        let Ok(message) = rx.recv_timeout(until.saturating_duration_since(Instant::now())) else {
+        let Some(message) = receive(until) else {
             break;
         };
         match message {
@@ -351,7 +368,7 @@ fn collect_race(
             match progress(&hits, &reference, &done, rule) {
                 Progress::Now => break,
                 Progress::Grace => {
-                    grace.get_or_insert_with(|| Instant::now() + PREFERENCE_GRACE);
+                    grace.get_or_insert_with(|| now() + PREFERENCE_GRACE);
                 }
                 Progress::Wait => {}
             }
@@ -440,7 +457,10 @@ fn cached(key: &CacheKey) -> Lookup {
     let Some(entry) = guard.as_ref().and_then(|c| c.get(key)) else {
         return Lookup::Miss;
     };
-    let age = entry.at.elapsed();
+    cached_answer(entry, entry.at.elapsed())
+}
+
+fn cached_answer(entry: &Cached, age: Duration) -> Lookup {
     let hit = |reply| ResolveHit {
         reply,
         provider: entry.provider.clone(),
@@ -749,30 +769,57 @@ mod tests {
         })
     }
 
+    // Drive the production collector with scheduled replies and a logical clock.
+    // Wall-clock assertions below 300 ms flake on a busy CI runner even when the
+    // collector stops at the right event. Unconsumed events prove early return.
+    fn scheduled_race(
+        messages: Vec<(Duration, RaceMsg)>,
+        budget: Duration,
+        rule: &Settle,
+    ) -> (Vec<RaceResult>, Vec<IpAddr>, Duration, usize) {
+        let start = Instant::now();
+        let now = std::cell::Cell::new(start);
+        let mut messages = std::collections::VecDeque::from(messages);
+        let (hits, reference) = collect_race_with(
+            |until| {
+                if messages.front().is_some_and(|(at, _)| start + *at <= until) {
+                    let (at, message) = messages.pop_front().unwrap();
+                    now.set(start + at);
+                    Some(message)
+                } else {
+                    now.set(until);
+                    None
+                }
+            },
+            || now.get(),
+            start + budget,
+            Some(rule),
+        );
+        (hits, reference, now.get() - start, messages.len())
+    }
+
     #[test]
     fn client_lookup_returns_once_no_pending_provider_can_win() {
         let rule = Settle {
             providers: 3,
             wants_address: true,
         };
-        let (tx, rx) = mpsc::channel();
-        tx.send(race_hit(0, vec![v4(142, 250, 1, 1)])).unwrap();
-        tx.send(RaceMsg::Done(0)).unwrap();
-        let worker = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(30));
-            // The lookup may return right after the answer and close the channel.
-            let _ = tx.send(race_hit(1, vec![v4(192, 0, 2, 1)]));
-            let _ = tx.send(RaceMsg::Done(1));
-            // Provider 2 and the reference DNS stay silent until the deadline.
-            thread::sleep(Duration::from_secs(2));
-            drop(tx);
-        });
-        let start = Instant::now();
-        let (hits, reference) =
-            collect_race(rx, Instant::now() + Duration::from_secs(2), Some(&rule));
-        assert!(start.elapsed() < PREFERENCE_GRACE);
+        let (hits, reference, elapsed, pending) = scheduled_race(
+            vec![
+                (Duration::ZERO, race_hit(0, vec![v4(142, 250, 1, 1)])),
+                (Duration::ZERO, RaceMsg::Done(0)),
+                (
+                    Duration::from_millis(30),
+                    race_hit(1, vec![v4(192, 0, 2, 1)]),
+                ),
+                (Duration::from_secs(1), RaceMsg::Done(2)),
+            ],
+            Duration::from_secs(2),
+            &rule,
+        );
+        assert_eq!(elapsed, Duration::from_millis(30));
+        assert_eq!(pending, 1);
         assert_eq!(hits[pick_winner(&hits, &reference).unwrap()].idx, 1);
-        worker.join().unwrap();
     }
 
     #[test]
@@ -781,31 +828,59 @@ mod tests {
             providers: 2,
             wants_address: true,
         };
-        let (tx, rx) = mpsc::channel();
-        tx.send(race_hit(1, vec![v4(192, 0, 2, 1)])).unwrap();
-        tx.send(RaceMsg::Done(1)).unwrap();
-        let start = Instant::now();
-        let (hits, _) = collect_race(rx, Instant::now() + Duration::from_secs(2), Some(&rule));
-        let elapsed = start.elapsed();
-        assert!(elapsed >= PREFERENCE_GRACE && elapsed < Duration::from_secs(1));
+        let (hits, _, elapsed, pending) = scheduled_race(
+            vec![
+                (Duration::ZERO, race_hit(1, vec![v4(192, 0, 2, 1)])),
+                (Duration::ZERO, RaceMsg::Done(1)),
+                (Duration::from_millis(100), RaceMsg::Reference(vec![])),
+                (
+                    Duration::from_secs(1),
+                    race_hit(0, vec![v4(198, 51, 100, 1)]),
+                ),
+            ],
+            Duration::from_secs(2),
+            &rule,
+        );
+        assert_eq!(elapsed, PREFERENCE_GRACE);
         assert_eq!(hits.len(), 1);
-        drop(tx);
+        assert_eq!(pending, 1);
 
-        let (tx, rx) = mpsc::channel();
-        tx.send(race_hit(1, vec![v4(192, 0, 2, 1)])).unwrap();
-        tx.send(RaceMsg::Done(1)).unwrap();
-        let worker = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(50));
-            let _ = tx.send(race_hit(0, vec![v4(198, 51, 100, 1)]));
-            let _ = tx.send(RaceMsg::Done(0));
-            thread::sleep(Duration::from_secs(2));
-        });
-        let start = Instant::now();
-        let (hits, reference) =
-            collect_race(rx, Instant::now() + Duration::from_secs(2), Some(&rule));
-        assert!(start.elapsed() < PREFERENCE_GRACE);
+        let (hits, reference, elapsed, pending) = scheduled_race(
+            vec![
+                (Duration::ZERO, race_hit(1, vec![v4(192, 0, 2, 1)])),
+                (Duration::ZERO, RaceMsg::Done(1)),
+                (
+                    Duration::from_millis(50),
+                    race_hit(0, vec![v4(198, 51, 100, 1)]),
+                ),
+                (Duration::from_secs(1), RaceMsg::Done(0)),
+            ],
+            Duration::from_secs(2),
+            &rule,
+        );
+        assert_eq!(elapsed, Duration::from_millis(50));
+        assert_eq!(pending, 1);
         assert_eq!(hits[pick_winner(&hits, &reference).unwrap()].idx, 0);
-        worker.join().unwrap();
+    }
+
+    #[test]
+    fn preferred_provider_grace_cannot_extend_the_lookup_deadline() {
+        let rule = Settle {
+            providers: 2,
+            wants_address: true,
+        };
+        let budget = Duration::from_millis(100);
+        let (hits, _, elapsed, pending) = scheduled_race(
+            vec![
+                (Duration::ZERO, race_hit(1, vec![v4(192, 0, 2, 1)])),
+                (PREFERENCE_GRACE, race_hit(0, vec![v4(198, 51, 100, 1)])),
+            ],
+            budget,
+            &rule,
+        );
+        assert_eq!(hits.len(), 1);
+        assert_eq!(elapsed, budget);
+        assert_eq!(pending, 1);
     }
 
     #[test]
@@ -899,15 +974,11 @@ mod tests {
         ] {
             let key = test_key(name);
             remember(key.clone(), &hit);
-            if let Some(entry) = PACKETS
-                .lock()
-                .unwrap()
-                .as_mut()
-                .and_then(|c| c.get_mut(&key))
-            {
-                entry.at = Instant::now().checked_sub(age).unwrap();
-            }
-            match (cached(&key), expected) {
+            // Model the answer age directly: Windows Instant cannot represent
+            // an hour before startup when this test runs soon after boot.
+            let guard = PACKETS.lock().unwrap();
+            let entry = guard.as_ref().unwrap().get(&key).unwrap();
+            match (cached_answer(entry, age), expected) {
                 (Lookup::Stale(stale), "stale") => {
                     let fresh = super::super::client::aged_reply(&stale.reply, 0).unwrap();
                     assert!(super::super::client::aged_reply(&fresh, STALE_TTL).is_none());

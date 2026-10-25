@@ -10,6 +10,9 @@ import tempfile
 
 root = Path(__file__).resolve().parents[1]
 version = tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8"))["package"]["version"]
+lock = tomllib.loads((root / "Cargo.lock").read_text(encoding="utf-8"))
+assert next(p["version"] for p in lock["package"] if p["name"] == "antigravity-bypass-russia") == version, "Manifest and lockfile versions differ"
+assert (root / "docs" / "releases" / f"v{version}.md").is_file(), "Release notes are missing"
 if os.environ.get("GITHUB_REF_TYPE") == "tag":
     assert os.environ["GITHUB_REF_NAME"] == f"v{version}", "Tag and package version differ"
 binary = Path(sys.argv[1]).resolve()

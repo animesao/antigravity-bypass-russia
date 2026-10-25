@@ -21,6 +21,156 @@ const WORKER_THREADS: usize = 32;
 static UPSTREAM_CACHE: std::sync::RwLock<Option<Vec<Ipv4Addr>>> = std::sync::RwLock::new(None);
 static IF_INDEX_CACHE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+#[cfg(any(windows, test))]
+#[derive(Default)]
+struct NetworkRefresh {
+    applied: Option<(u32, Ipv4Addr)>,
+}
+
+#[cfg(any(windows, test))]
+impl NetworkRefresh {
+    fn update(
+        &mut self,
+        physical: Option<(u32, Ipv4Addr)>,
+        mut apply: impl FnMut(u32, Ipv4Addr) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let Some((interface, gateway)) = physical else {
+            // Retry even the same gateway when connectivity returns after sleep.
+            self.applied = None;
+            return Ok(());
+        };
+        if self.applied != physical {
+            apply(interface, gateway)?;
+            // An interrupted/locked refresh is retried, never marked complete.
+            self.applied = physical;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn refresh_windows_network(state: &mut NetworkRefresh) -> Result<(), String> {
+    let physical = super::egress::detect_physical().and_then(|(interface, gateway)| {
+        gateway
+            .parse::<Ipv4Addr>()
+            .ok()
+            .map(|gateway| (interface, gateway))
+    });
+    state.update(physical, |interface, gateway| {
+        // Setup/rollback owns this same lock. A foreground setup has already
+        // prepared the routes before launching us; retry after it releases it.
+        let _configuration = super::configuration_lock()?;
+        super::routes::restore_recorded_routes(interface, gateway)?;
+        save_if_index(interface);
+        if let Ok(mut cache) = UPSTREAM_CACHE.write() {
+            *cache = None;
+        }
+        resolvers::invalidate_network_caches();
+        Ok(())
+    })
+}
+
+#[cfg(windows)]
+struct RouteNotifications {
+    handle: *mut std::ffi::c_void,
+    context: Option<Box<mpsc::SyncSender<()>>>,
+}
+
+#[cfg(windows)]
+#[link(name = "iphlpapi")]
+extern "system" {
+    fn NotifyRouteChange2(
+        family: u16,
+        callback: unsafe extern "system" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, u32),
+        context: *mut std::ffi::c_void,
+        initial: u8,
+        handle: *mut *mut std::ffi::c_void,
+    ) -> u32;
+    fn CancelMibChangeNotify2(handle: *mut std::ffi::c_void) -> u32;
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn route_changed(
+    context: *mut std::ffi::c_void,
+    _row: *mut std::ffi::c_void,
+    _notification: u32,
+) {
+    // Coalesce notifications, including the routes we recreate ourselves.
+    // No network query, blocking send or lock runs on the OS callback thread.
+    let sender = &*context.cast::<mpsc::SyncSender<()>>();
+    let _ = sender.try_send(());
+}
+
+#[cfg(windows)]
+impl RouteNotifications {
+    fn new(sender: mpsc::SyncSender<()>) -> Option<Self> {
+        let mut context = Box::new(sender);
+        let mut handle = std::ptr::null_mut();
+        let code = unsafe {
+            NotifyRouteChange2(
+                2, // AF_INET
+                route_changed,
+                (&mut *context as *mut mpsc::SyncSender<()>).cast(),
+                0,
+                &mut handle,
+            )
+        };
+        if code != 0 {
+            return None;
+        }
+        Some(Self {
+            handle,
+            context: Some(context),
+        })
+    }
+}
+
+#[cfg(windows)]
+impl Drop for RouteNotifications {
+    fn drop(&mut self) {
+        // Cancellation runs outside the callback and waits for pending calls.
+        if unsafe { CancelMibChangeNotify2(self.handle) } != 0 {
+            // On an unexpected cancellation failure preserve the callback's
+            // allocation until process exit instead of exposing freed memory.
+            if let Some(context) = self.context.take() {
+                let _ = Box::leak(context);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn start_network_refresh() {
+    // Route discovery and recovery can invoke OS utilities. Keep every one of
+    // those operations off the DNS startup/readiness path, including boot.
+    thread::spawn(move || {
+        let (wake, notifications) = mpsc::sync_channel(1);
+        let _subscription = RouteNotifications::new(wake.clone());
+        let _keep_channel_open = wake;
+        let mut state = NetworkRefresh::default();
+        let mut previous_error = None;
+        loop {
+            let error = refresh_windows_network(&mut state).err();
+            if error != previous_error {
+                match &error {
+                    Some(error) => log_event(&format!("Обновление подключения отложено: {error}")),
+                    None => log_event("Маршруты и DNS обновлены для текущего подключения"),
+                }
+            }
+            let delay = if error.is_some() || state.applied.is_none() {
+                Duration::from_secs(5)
+            } else {
+                Duration::from_secs(60)
+            };
+            previous_error = error;
+            // Notifications react immediately to adapter/gateway changes. The
+            // timeout covers offline boot, a busy foreground lock and missed
+            // notifications without repeatedly spawning utilities on VPNs.
+            let _ = notifications.recv_timeout(delay);
+        }
+    });
+}
+
 pub fn detach_console() {
     #[cfg(target_os = "windows")]
     {
@@ -171,6 +321,8 @@ pub fn log_fatal(msg: &str) {
 
 pub fn run() -> Result<(), String> {
     let _ = load_if_index();
+    #[cfg(windows)]
+    start_network_refresh();
     let addr = format!("{}:{}", LISTEN_IP, LISTEN_PORT);
     let socket =
         UdpSocket::bind(&addr).map_err(|e| format!("Не удалось занять {}: {}", addr, e))?;
@@ -314,6 +466,86 @@ pub fn local_dns_available() -> Result<bool, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn route_notifications_are_coalesced_without_blocking_the_os_callback() {
+        let (mut sender, receiver) = mpsc::sync_channel(1);
+        for _ in 0..3 {
+            unsafe {
+                route_changed(
+                    (&mut sender as *mut mpsc::SyncSender<()>).cast(),
+                    std::ptr::null_mut(),
+                    0,
+                );
+            }
+        }
+        receiver.try_recv().unwrap();
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn startup_and_gateway_changes_restore_routes_once_per_connection() {
+        let mut refresh = NetworkRefresh::default();
+        let ethernet = Some((7, "192.0.2.1".parse().unwrap()));
+        let wifi = Some((9, "198.51.100.1".parse().unwrap()));
+        let changed_gateway = Some((9, "198.51.100.254".parse().unwrap()));
+        let mut applied = Vec::new();
+        for connection in [
+            None,
+            ethernet,
+            ethernet,
+            wifi,
+            changed_gateway,
+            None,
+            changed_gateway,
+        ] {
+            refresh
+                .update(connection, |interface, gateway| {
+                    applied.push((interface, gateway));
+                    Ok(())
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            applied,
+            [
+                ethernet.unwrap(),
+                wifi.unwrap(),
+                changed_gateway.unwrap(),
+                changed_gateway.unwrap()
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_or_busy_startup_refresh_is_retried_without_losing_the_last_connection() {
+        let mut refresh = NetworkRefresh::default();
+        let original = Some((7, "192.0.2.1".parse().unwrap()));
+        let changed = Some((9, "198.51.100.1".parse().unwrap()));
+        assert!(refresh
+            .update(original, |_, _| Err("foreground owns lock".into()))
+            .is_err());
+        assert_eq!(refresh.applied, None);
+        refresh.update(original, |_, _| Ok(())).unwrap();
+        assert!(refresh
+            .update(changed, |_, _| Err("route operation failed".into()))
+            .is_err());
+        assert_eq!(refresh.applied, original);
+        let mut retried = false;
+        refresh
+            .update(changed, |_, _| {
+                retried = true;
+                Ok(())
+            })
+            .unwrap();
+        assert!(retried);
+        assert_eq!(refresh.applied, changed);
+    }
+
     #[test]
     fn address_family_and_service_binding_questions_skip_upstream() {
         for qtype in [28u16, 64, 65] {

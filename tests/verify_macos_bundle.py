@@ -23,15 +23,26 @@ assert bash and Path(bash).is_file(), "Bash is required to verify the release la
 with tempfile.TemporaryDirectory(prefix="ag-bundle-test-") as temp:
     root = Path(temp)
     launcher = root / "unlock_and_restore.sh"
-    launcher.write_text(script, encoding="utf-8", newline="\n")
+    arm_path, x64_path = root / "arm64", root / "x64"
+    arm_path.write_bytes(arm)
+    x64_path.write_bytes(x64)
+    # Exercise the actual CLI writer on the interpreter running the test. An
+    # in-memory bundle() check missed write_text(newline=...) on Python 3.9.
+    subprocess.run([sys.executable, str(ROOT / "scripts/bundle_macos_launcher.py"),
+                    "--arm64", str(arm_path), "--x64", str(x64_path),
+                    "--output", str(launcher)], check=True, timeout=10)
+    assert launcher.read_bytes() == script.encode("utf-8")
+    assert b"\r" not in launcher.read_bytes()
+    if os.name != "nt":
+        assert launcher.stat().st_mode & 0o111 == 0o111
     subprocess.run([bash, "-n", str(launcher)], check=True, timeout=10)
     for arch in ["arm64", "x86_64"]:
         environment = root / "test-env.sh"
-        environment.write_text(
+        environment.write_bytes((
             f'uname() {{ if [[ "$1" == -s ]]; then echo Darwin; else echo {arch}; fi; }}\n'
             # Test the real decoder on the host with its supported flag.
-            + ('base64() { command base64 -d; }\n' if sys.platform != 'darwin' else ''),
-            encoding="utf-8", newline="\n")
+            + ('base64() { command base64 -d; }\n' if sys.platform != 'darwin' else '')
+        ).encode("utf-8"))
         env = dict(os.environ, BASH_ENV=environment.as_posix(), MSYS_NO_PATHCONV="1", PATH="")
         result = subprocess.run([bash, str(launcher), "--check", "space and кириллица"], env=env,
                                 capture_output=True, encoding="utf-8", timeout=10)

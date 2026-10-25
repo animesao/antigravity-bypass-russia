@@ -143,9 +143,13 @@ pub fn ensure_admin() {
             .chain(Some(0))
             .collect();
         let verb: Vec<u16> = OsStr::new("runas").encode_wide().chain(Some(0)).collect();
+        let origin_args = super::user_context::elevation_arguments().unwrap_or_else(|error| {
+            eprintln!("Не удалось сохранить профиль пользователя: {error}");
+            std::process::exit(1);
+        });
         let args = windows_arguments(
-            std::env::args_os()
-                .skip(1)
+            origin_args
+                .into_iter()
                 .map(|a| a.encode_wide().collect::<Vec<_>>())
                 .collect(),
         );
@@ -175,7 +179,10 @@ pub fn ensure_admin() {
     #[cfg(target_os = "macos")]
     {
         let current_exe = std::env::current_exe().unwrap_or_default();
-        let args: Vec<String> = std::env::args().skip(1).collect();
+        let args = super::user_context::elevation_arguments().unwrap_or_else(|error| {
+            eprintln!("Не удалось сохранить профиль пользователя: {error}");
+            std::process::exit(1);
+        });
 
         let is_tty = unsafe { libc::isatty(0) == 1 };
         if is_tty {
@@ -191,7 +198,7 @@ pub fn ensure_admin() {
         } else {
             let shell_quote = |s: &str| format!("'{}'", s.replace('\'', "'\"'\"'"));
             let command = std::iter::once(current_exe.to_string_lossy().into_owned())
-                .chain(args)
+                .chain(args.into_iter().map(|a| a.to_string_lossy().into_owned()))
                 .map(|s| shell_quote(&s))
                 .collect::<Vec<_>>()
                 .join(" ");

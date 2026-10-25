@@ -78,16 +78,48 @@ pub fn discover_agent(if_index: u32) -> Result<Vec<RankedHost>, String> {
         }
         ranked.push(RankedHost { host, ips });
     }
-    if ranked.iter().all(|h| h.ips.is_empty()) {
-        return Err("Нет проверенных маршрутов; прежние hosts и рейтинг сохранены".into());
-    }
+    require_complete_agent_routes(&ranked)?;
     Ok(ranked)
 }
 
 pub fn apply_ranked(ranked: &[RankedHost]) -> Result<(), String> {
-    routes::sync_physical_hosts(&ranked_ips(ranked))?;
-    save(ranked)?;
-    apply_hosts(ranked)
+    apply_complete_ranking(ranked, || {
+        routes::sync_physical_hosts(&ranked_ips(ranked))?;
+        save(ranked)?;
+        apply_hosts(ranked)
+    })
+}
+
+// An incomplete scan must never replace a previously working hosts block or
+// ranking. In particular, a reachable native endpoint cannot stand in for the
+// daily endpoint that is configured in the application.
+fn require_complete_agent_routes(ranked: &[RankedHost]) -> Result<(), String> {
+    let missing: Vec<_> = NRPT_AGENT
+        .iter()
+        .filter(|host| {
+            let mut rows = ranked
+                .iter()
+                .filter(|row| super::route_health::host_name(&row.host) == **host);
+            !matches!(rows.next(), Some(row) if !row.ips.is_empty()) || rows.next().is_some()
+        })
+        .copied()
+        .collect();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Нет однозначного проверенного маршрута для {}; прежние hosts и рейтинг сохранены",
+            missing.join(", ")
+        ))
+    }
+}
+
+fn apply_complete_ranking(
+    ranked: &[RankedHost],
+    apply: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    require_complete_agent_routes(ranked)?;
+    apply()
 }
 
 pub fn format_notes(ranked: &[RankedHost]) -> Vec<String> {
@@ -180,4 +212,63 @@ fn load() -> Vec<RankedHost> {
         }
     }
     ranked
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn complete_ranking() -> Vec<RankedHost> {
+        NRPT_AGENT
+            .iter()
+            .enumerate()
+            .map(|(index, host)| RankedHost {
+                host: (*host).into(),
+                ips: vec![(Ipv4Addr::new(192, 0, 2, index as u8 + 1), 10)],
+            })
+            .collect()
+    }
+
+    #[test]
+    fn incomplete_scan_preserves_previous_hosts_and_ranking_before_any_write() {
+        let directory = tempfile::tempdir().unwrap();
+        let hosts = directory.path().join("hosts");
+        let rank = directory.path().join("proxy_rank.conf");
+        fs::write(&hosts, b"previous working hosts").unwrap();
+        fs::write(&rank, b"previous working ranking").unwrap();
+        for missing in 0..NRPT_AGENT.len() {
+            let mut ranked = complete_ranking();
+            ranked.remove(missing);
+            let error = apply_complete_ranking(&ranked, || {
+                fs::write(&rank, b"replacement").unwrap();
+                fs::write(&hosts, b"replacement").unwrap();
+                Ok(())
+            })
+            .unwrap_err();
+            assert!(error.contains(NRPT_AGENT[missing]), "{error}");
+            assert_eq!(fs::read(&rank).unwrap(), b"previous working ranking");
+            assert_eq!(fs::read(&hosts).unwrap(), b"previous working hosts");
+        }
+    }
+
+    #[test]
+    fn every_agent_needs_one_nonempty_route_and_complete_scans_can_be_applied() {
+        let ranked = complete_ranking();
+        for index in 0..ranked.len() {
+            let mut empty = ranked.clone();
+            empty[index].ips.clear();
+            assert!(require_complete_agent_routes(&empty).is_err());
+            let mut duplicate = ranked.clone();
+            duplicate.push(ranked[index].clone());
+            assert!(require_complete_agent_routes(&duplicate).is_err());
+        }
+        assert!(require_complete_agent_routes(&[]).is_err());
+        let mut applied = false;
+        apply_complete_ranking(&ranked, || {
+            applied = true;
+            Ok(())
+        })
+        .unwrap();
+        assert!(applied);
+    }
 }

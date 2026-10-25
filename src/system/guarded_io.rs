@@ -306,17 +306,7 @@ fn replace_with(
     let result: Result<(), String> = (|| {
         #[cfg(target_os = "macos")]
         {
-            let our_pid = format!("(PID {})", std::process::id());
-            let others: Vec<_> = super::file_lock::holders(&[captured.clone()])?
-                .into_iter()
-                .filter(|holder| !holder.ends_with(&our_pid))
-                .collect();
-            if !others.is_empty() {
-                return Err(format!(
-                    "Сохранённый файл открыт другим процессом: {}. Закройте обновление и повторите",
-                    others.join(", ")
-                ));
-            }
+            super::file_lock::wait_for_other_holders(&[captured.clone()])?;
         }
         #[cfg(unix)]
         {
@@ -629,7 +619,7 @@ mod tests {
     #[test]
     fn macos_refuses_an_updater_holding_the_claimed_inode() {
         use std::{
-            process::Command,
+            process::{Command, Stdio},
             time::{Duration, Instant},
         };
         let dir = tempfile::tempdir().unwrap();
@@ -638,10 +628,14 @@ mod tests {
         fs::write(&path, b"patched").unwrap();
         let mut child = Command::new("/bin/sh")
             .arg("-c")
-            .arg("exec 3>>\"$1\"; printf ready > \"$2\"; exec /bin/sleep 5")
+            // Keep the holder alive until the parent terminates it. A fixed
+            // sleep can expire while a loaded runner is still checking lsof.
+            .arg("exec 3>>\"$1\"; printf ready > \"$2\"; exec /bin/cat")
             .arg("fixture")
             .arg(&path)
             .arg(&ready)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
             .spawn()
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);

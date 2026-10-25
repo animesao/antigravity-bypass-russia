@@ -34,9 +34,20 @@ fn continue_setup(outcome: FileSetupOutcome, next: impl FnOnce() -> bool) -> Fil
     }
 }
 
+// A failed DNS/ranking update must leave the application's endpoint alone.
+// Both full setup and DNS-only setup use this same ordering.
+fn configure_connection_with<T>(
+    network: impl FnOnce() -> Result<T, String>,
+    endpoints: impl FnOnce() -> Result<(), String>,
+) -> Result<T, String> {
+    let setup = network()?;
+    endpoints()?;
+    Ok(setup)
+}
+
 #[cfg(test)]
 mod setup_tests {
-    use super::{continue_setup, FileSetupOutcome};
+    use super::{configure_connection_with, continue_setup, FileSetupOutcome};
 
     #[test]
     fn cancelled_or_blocked_file_setup_skips_all_following_mutations() {
@@ -55,27 +66,67 @@ mod setup_tests {
         for files_ok in [false, true] {
             for side_ok in [false, true] {
                 for network_ok in [false, true] {
-                    let mut stages = vec!["patch files and clear caches"];
+                    let stages = std::cell::RefCell::new(vec!["patch files and clear caches"]);
                     let outcome = continue_setup(FileSetupOutcome::Completed(files_ok), || {
-                        stages.push("configure endpoints");
-                        side_ok
+                        configure_connection_with(
+                            || {
+                                stages.borrow_mut().push("configure DNS");
+                                if network_ok {
+                                    Ok(())
+                                } else {
+                                    Err("network".into())
+                                }
+                            },
+                            || {
+                                stages.borrow_mut().push("configure endpoints");
+                                if side_ok {
+                                    Ok(())
+                                } else {
+                                    Err("endpoint".into())
+                                }
+                            },
+                        )
+                        .is_ok()
                     });
-                    let outcome = continue_setup(outcome, || {
-                        stages.push("configure DNS and refresh endpoints");
-                        network_ok
-                    });
-                    assert_eq!(
-                        stages,
-                        [
+                    let expected = if network_ok {
+                        vec![
                             "patch files and clear caches",
+                            "configure DNS",
                             "configure endpoints",
-                            "configure DNS and refresh endpoints"
                         ]
-                    );
+                    } else {
+                        vec!["patch files and clear caches", "configure DNS"]
+                    };
+                    assert_eq!(*stages.borrow(), expected);
                     assert_eq!(outcome.succeeded(), files_ok && side_ok && network_ok);
                 }
             }
         }
+    }
+
+    #[test]
+    fn missing_daily_route_keeps_endpoint_file_unchanged_and_creates_no_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join("settings.json");
+        let cli_override = dir.path().join("cli_endpoint.json");
+        let original = b"{\"jetski.cloudCodeUrl\":\"https://cloudcode-pa.googleapis.com\"}";
+        std::fs::write(&settings, original).unwrap();
+        let error = configure_connection_with(
+            || {
+                Err::<(), _>(
+                    "Нет проверенного маршрута для daily-cloudcode-pa.googleapis.com".into(),
+                )
+            },
+            || {
+                std::fs::write(&settings, b"daily endpoint").unwrap();
+                std::fs::write(&cli_override, b"new override").unwrap();
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("daily-cloudcode"));
+        assert_eq!(std::fs::read(settings).unwrap(), original);
+        assert!(!cli_override.exists());
     }
 }
 
@@ -202,18 +253,31 @@ fn patch_targets(targets: Vec<FoundTarget>) -> FileSetupOutcome {
     }
     FileSetupOutcome::Completed(ok)
 }
-fn apply_files_side() -> bool {
-    let mut ok = true;
+fn apply_endpoints() -> Result<(), String> {
+    let mut errors = Vec::new();
     for note in crate::core::endpoint::apply_all() {
         match note {
             Ok(msg) => crate::net::relay::log_event(&msg),
             Err(e) => {
-                ok = false;
-                operation_error("Не удалось завершить настройку", &e);
+                errors.push(e);
             }
         }
     }
-    ok
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+fn apply_connection() -> bool {
+    match configure_connection_with(apply_dns_rules, apply_endpoints) {
+        Ok(setup) => show_network_result(&setup),
+        Err(error) => {
+            operation_error("Не удалось завершить настройку подключения", &error);
+            false
+        }
+    }
 }
 fn patch_installations() -> FileSetupOutcome {
     if let Err(error) = recover_installations() {
@@ -233,7 +297,7 @@ fn patch_installations() -> FileSetupOutcome {
         eprintln!("[✗] Файлы приложения не найдены; укажите путь в пункте 4.");
         return FileSetupOutcome::Stopped;
     }
-    continue_setup(patch_targets(targets), apply_files_side)
+    patch_targets(targets)
 }
 fn show_result(ok: bool) {
     if ok {
@@ -246,12 +310,17 @@ fn show_result(ok: bool) {
 
 fn show_network_result(setup: &crate::net::NetworkSetup) -> bool {
     crate::net::relay::log_event(&setup.message);
-    if setup.local_relay_running {
+    if setup.hosts_fallback {
+        println!("  \x1b[92m✓\x1b[0m Подключение Antigravity настроено через hosts");
+    } else if setup.local_relay_running {
         println!("  \x1b[92m✓\x1b[0m DNS настроен. Прямое подключение, без фонового подбора");
     } else {
         eprintln!("  \x1b[93m!\x1b[0m Используются прямые DNS и сохранённые адреса");
         eprintln!("  {}", setup.message);
         print_error_details();
+    }
+    for note in &setup.compatibility_notes {
+        eprintln!("  \x1b[93m!\x1b[0m {note}");
     }
     true
 }
@@ -262,35 +331,14 @@ pub fn handle_unlock_all() -> bool {
     if !check_vpn_before_setup() {
         return false;
     }
-    let outcome = continue_setup(patch_installations(), || {
-        let mut ok;
-        match apply_dns_rules() {
-            Ok(setup) => {
-                ok = show_network_result(&setup);
-                for note in crate::core::endpoint::apply_all() {
-                    match note {
-                        Ok(msg) => crate::net::relay::log_event(&msg),
-                        Err(e) => {
-                            operation_error("Не удалось завершить настройку", &e);
-                            ok = false;
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                operation_error("Не удалось настроить подключение", &e);
-                ok = false;
-            }
-        }
-        ok
-    });
+    let outcome = continue_setup(patch_installations(), apply_connection);
     let ok = outcome.succeeded();
     show_result(ok);
     pause();
     ok
 }
 pub fn handle_patch_files_only() -> bool {
-    let ok = if let Some(path) = std::env::args().nth(2) {
+    let ok = if let Some(path) = crate::system::env::args().nth(2) {
         patch_root(&expand_env_vars(&path))
     } else {
         patch_installations().succeeded()
@@ -303,16 +351,7 @@ pub fn handle_dns_only() -> bool {
     if !check_vpn_before_setup() {
         return false;
     }
-    if !apply_files_side() {
-        return false;
-    }
-    let ok = match apply_dns_rules() {
-        Ok(setup) => show_network_result(&setup),
-        Err(e) => {
-            operation_error("Не удалось завершить настройку", &e);
-            false
-        }
-    };
+    let ok = apply_connection();
     pause();
     ok
 }
@@ -349,9 +388,10 @@ fn ensure_application_closed(paths: &[std::path::PathBuf], action: &str) -> bool
     match running {
         Ok(holders) if !holders.is_empty() => {
             println!("  \x1b[93mНужно закрыть Antigravity\x1b[0m");
+            println!("  Файлы используют: {}", holders.join(", "));
             println!("  Перед изменением файлов завершите IDE, CLI и языковой сервер.");
             println!("  Сохраните работу: несохранённые изменения будут потеряны.\n");
-            if std::env::args().len() > 1 {
+            if crate::system::env::args().len() > 1 {
                 operation_error(
                     "Закройте Antigravity и повторите команду",
                     &holders.join(", "),
@@ -359,9 +399,9 @@ fn ensure_application_closed(paths: &[std::path::PathBuf], action: &str) -> bool
                 return false;
             }
             println!("  \x1b[96mВыберите действие\x1b[0m");
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "macos"))]
             println!("  \x1b[1m[1]\x1b[0m  Закрыть Antigravity и продолжить: {action}");
-            #[cfg(not(windows))]
+            #[cfg(not(any(windows, target_os = "macos")))]
             println!("  \x1b[1m[1]\x1b[0m  Я закрыл Antigravity — проверить и продолжить");
             println!("  \x1b[1m[0]\x1b[0m  Отмена — вернуться в меню\n");
             loop {
@@ -374,15 +414,16 @@ fn ensure_application_closed(paths: &[std::path::PathBuf], action: &str) -> bool
                     _ => println!("  Введите номер действия: 1 — продолжить, 0 — отмена."),
                 }
             }
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "macos"))]
             println!("\n  Закрываем Antigravity…");
-            #[cfg(not(windows))]
+            #[cfg(not(any(windows, target_os = "macos")))]
             println!("\n  Проверяем открытые файлы…");
             if let Err(error) = crate::system::file_lock::close_application(paths) {
-                operation_error(
-                    "Не удалось закрыть приложение. Закройте его вручную",
-                    &error,
-                );
+                #[cfg(any(windows, target_os = "macos"))]
+                let message = "Не удалось закрыть приложение. Закройте его вручную";
+                #[cfg(not(any(windows, target_os = "macos")))]
+                let message = "Не удалось подтвердить, что файлы Antigravity свободны";
+                operation_error(message, &error);
                 print_error_details();
                 pause();
                 return false;
@@ -401,7 +442,7 @@ fn ensure_application_closed(paths: &[std::path::PathBuf], action: &str) -> bool
 }
 
 pub fn handle_rollback() -> bool {
-    let installs = if let Some(path) = std::env::args().nth(2) {
+    let installs = if let Some(path) = crate::system::env::args().nth(2) {
         let root = expand_env_vars(&path);
         if let Err(error) = recover_targets_in_path(&root) {
             operation_error("Не удалось восстановить прерванную запись", &error);
@@ -431,7 +472,7 @@ pub fn handle_rollback() -> bool {
     for root in installs {
         let targets = find_targets_in_path(&root);
         if targets.is_empty() {
-            if std::env::args().nth(2).is_some() {
+            if crate::system::env::args().nth(2).is_some() {
                 eprintln!("[✗] Цели для отката не найдены: {}", root.display());
                 ok = false;
             }

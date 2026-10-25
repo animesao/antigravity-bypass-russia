@@ -7,12 +7,10 @@ pub fn holders(paths: &[PathBuf]) -> Result<Vec<String>, String> {
 }
 
 pub fn close_application(paths: &[PathBuf]) -> Result<(), String> {
-    #[cfg(not(windows))]
-    return if holders(paths)?.is_empty() {
-        Ok(())
-    } else {
-        Err("Закройте Antigravity вручную и повторите отключение.".into())
-    };
+    #[cfg(target_os = "macos")]
+    return crate::system::macos_shutdown::close_application(paths);
+    #[cfg(not(any(windows, target_os = "macos")))]
+    return wait_for_holders_to_exit(|| holders(paths), std::time::Duration::from_secs(5));
     #[cfg(windows)]
     {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -30,6 +28,60 @@ pub fn close_application(paths: &[PathBuf]) -> Result<(), String> {
             }
             std::thread::sleep(std::time::Duration::from_millis(200));
         }
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn wait_for_other_holders(paths: &[PathBuf]) -> Result<(), String> {
+    // A concurrent fork can briefly inherit our open file before exec closes
+    // close-on-exec descriptors. Confirm the lock instead of treating that
+    // snapshot as a running updater. Persistent holders still prevent writes.
+    wait_for_other_holders_with(
+        || holders(paths),
+        std::process::id(),
+        std::time::Duration::from_secs(1),
+    )
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn wait_for_other_holders_with(
+    mut query: impl FnMut() -> Result<Vec<String>, String>,
+    our_pid: u32,
+    budget: std::time::Duration,
+) -> Result<(), String> {
+    let own_pid = format!("(PID {our_pid})");
+    wait_for_holders_to_exit(
+        || {
+            Ok(query()?
+                .into_iter()
+                .filter(|holder| !holder.ends_with(&own_pid))
+                .collect())
+        },
+        budget,
+    )
+}
+
+#[cfg(any(not(windows), test))]
+fn wait_for_holders_to_exit(
+    mut query: impl FnMut() -> Result<Vec<String>, String>,
+    budget: std::time::Duration,
+) -> Result<(), String> {
+    let started = std::time::Instant::now();
+    loop {
+        let remaining = query()?;
+        if remaining.is_empty() {
+            return Ok(());
+        }
+        if started.elapsed() >= budget {
+            return Err(format!(
+                "Файлы Antigravity всё ещё используются: {}. Завершите эти процессы и повторите операцию.",
+                remaining.join(", ")
+            ));
+        }
+        // Closing the IDE window does not instantly release its helpers/files.
+        std::thread::sleep(
+            std::time::Duration::from_millis(200).min(budget.saturating_sub(started.elapsed())),
+        );
     }
 }
 
@@ -51,7 +103,9 @@ pub fn running_applications(paths: &[PathBuf]) -> Result<Vec<String>, String> {
             })
             .collect())
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    return crate::system::macos_shutdown::running_applications(paths);
+    #[cfg(not(any(windows, target_os = "macos")))]
     holders(paths)
 }
 
@@ -79,6 +133,7 @@ fn stop_owned_processes(paths: &[PathBuf]) -> Result<(), String> {
     }
 }
 
+#[cfg(windows)]
 fn owned_application(executable: &std::path::Path, paths: &[PathBuf]) -> bool {
     let name = executable
         .file_name()
@@ -86,7 +141,9 @@ fn owned_application(executable: &std::path::Path, paths: &[PathBuf]) -> bool {
         .to_string_lossy()
         .to_ascii_lowercase();
     let normalize = |path: &std::path::Path| {
-        path.to_string_lossy()
+        // canonicalize() returns verbatim paths, while process image queries
+        // normally return DOS/UNC paths. Compare both spellings consistently.
+        crate::system::env::display_path(path)
             .replace('/', "\\")
             .to_ascii_lowercase()
     };
@@ -266,6 +323,104 @@ fn parse_lsof(code: Option<i32>, stdout: &str, stderr: &str) -> Result<Vec<Strin
 
 #[cfg(test)]
 mod mac_lock_tests {
+    use super::wait_for_holders_to_exit;
+    use std::time::Duration;
+
+    #[test]
+    fn transient_inherited_handle_is_rechecked_and_our_own_handle_is_allowed() {
+        let ours = "patcher (PID 123)".to_string();
+        let mut snapshots =
+            [vec![ours.clone(), "patcher (PID 456)".into()], vec![ours]].into_iter();
+        super::wait_for_other_holders_with(
+            || Ok(snapshots.next().unwrap()),
+            123,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(snapshots.next().is_none());
+    }
+
+    #[test]
+    fn persistent_holder_is_blocked_even_if_its_name_matches_the_patcher() {
+        let error = super::wait_for_other_holders_with(
+            || Ok(vec!["patcher (PID 123)".into(), "patcher (PID 456)".into()]),
+            123,
+            Duration::ZERO,
+        )
+        .unwrap_err();
+        assert!(error.contains("PID 456"));
+        assert!(!error.contains("PID 123"));
+    }
+
+    #[test]
+    fn failed_holder_recheck_does_not_allow_publication() {
+        let mut snapshots = [
+            Ok(vec!["updater (PID 456)".into()]),
+            Err("lsof failed".into()),
+        ]
+        .into_iter();
+        let error = super::wait_for_other_holders_with(
+            || snapshots.next().unwrap(),
+            123,
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert_eq!(error, "lsof failed");
+    }
+
+    #[test]
+    fn recheck_waits_for_a_closing_helper_to_release_its_files() {
+        let mut snapshots = [vec!["Antigravity Helper (PID 123)".into()], vec![]].into_iter();
+        wait_for_holders_to_exit(|| Ok(snapshots.next().unwrap()), Duration::from_secs(5)).unwrap();
+        assert!(snapshots.next().is_none());
+    }
+
+    #[test]
+    fn busy_files_report_the_actual_holders_and_do_not_assume_rollback() {
+        let error = wait_for_holders_to_exit(
+            || {
+                Ok(vec![
+                    "Antigravity Helper (PID 123)".into(),
+                    "agy (PID 456)".into(),
+                ])
+            },
+            Duration::ZERO,
+        )
+        .unwrap_err();
+        assert!(error.contains("Antigravity Helper (PID 123)"), "{error}");
+        assert!(error.contains("agy (PID 456)"), "{error}");
+        assert!(error.contains("повторите операцию"), "{error}");
+    }
+
+    #[test]
+    fn timeout_reports_the_latest_holder_instead_of_a_process_that_already_exited() {
+        let mut snapshots = [
+            vec!["helper (PID 123)".into()],
+            vec!["agy (PID 456)".into()],
+        ]
+        .into_iter();
+        let error =
+            wait_for_holders_to_exit(|| Ok(snapshots.next().unwrap()), Duration::from_millis(10))
+                .unwrap_err();
+        assert!(error.contains("agy (PID 456)"), "{error}");
+        assert!(!error.contains("PID 123"), "{error}");
+    }
+
+    #[test]
+    fn recheck_propagates_inspection_errors_instead_of_assuming_files_are_free() {
+        let error = wait_for_holders_to_exit(
+            || Err("lsof: permission denied".into()),
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert_eq!(error, "lsof: permission denied");
+    }
+
+    #[test]
+    fn already_closed_application_does_not_need_a_wait() {
+        wait_for_holders_to_exit(|| Ok(vec![]), Duration::ZERO).unwrap();
+    }
+
     #[test]
     fn lsof_partial_match_is_busy_and_empty_exit_one_is_free() {
         assert_eq!(
@@ -278,10 +433,99 @@ mod mac_lock_tests {
         assert!(super::parse_lsof(Some(1), "", "permission denied").is_err());
         assert!(super::parse_lsof(Some(0), "unexpected output", "").is_err());
     }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "launched only by the isolated macOS file-holder regression test"]
+    fn hold_file_fixture() {
+        let file = std::fs::File::open(std::env::var_os("ABR_TEST_LOCK_FILE").unwrap()).unwrap();
+        std::fs::write(std::env::var_os("ABR_TEST_LOCK_READY").unwrap(), b"ready").unwrap();
+        std::thread::sleep(Duration::from_secs(30));
+        drop(file);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_checks_open_files_instead_of_antigravity_in_a_process_name() {
+        use std::{fs, os::unix::process::CommandExt, process::Command, time::Instant};
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("Antigravity-target.js");
+        let unrelated = directory.path().join("unrelated.js");
+        let ready = directory.path().join("ready");
+        fs::write(&target, b"target").unwrap();
+        fs::write(&unrelated, b"unrelated").unwrap();
+
+        struct Fixture(std::process::Child);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = Fixture(
+            Command::new(std::env::current_exe().unwrap())
+                .arg0(format!("Antigravity-script {}", unrelated.display()))
+                .args([
+                    "--exact",
+                    "system::file_lock::mac_lock_tests::hold_file_fixture",
+                    "--ignored",
+                ])
+                .env("ABR_TEST_LOCK_FILE", &target)
+                .env("ABR_TEST_LOCK_READY", &ready)
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(ready.exists(), "file-holder fixture did not become ready");
+        let holders = super::holders(&[target.clone()]).unwrap();
+        assert!(
+            holders
+                .iter()
+                .any(|holder| holder.contains(&format!("PID {}", child.0.id()))),
+            "{holders:?}"
+        );
+        // The patcher and fixture names/arguments contain Antigravity; only the
+        // actual open file must matter, even when another filename is in argv.
+        assert!(super::holders(&[unrelated.clone()]).unwrap().is_empty());
+        super::close_application(&[unrelated]).unwrap();
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        super::close_application(&[target]).unwrap();
+    }
 }
 
 #[cfg(all(test, windows))]
 mod tests {
+    #[test]
+    fn shutdown_matches_verbatim_windows_and_unc_target_paths() {
+        use std::path::Path;
+        for (target, executable) in [
+            (r"\\?\C:\Tools\agy.exe", r"C:\Tools\agy.exe"),
+            (
+                r"\\?\C:\Apps\Antigravity\resources\bin\language_server.exe",
+                r"C:\Apps\Antigravity\Antigravity.exe",
+            ),
+            (
+                r"\\?\C:\Apps\Antigravity\resources\bin\language_server.exe",
+                r"C:\Apps\Antigravity\resources\node.exe",
+            ),
+            (r"\\?\UNC\server\apps\agy.exe", r"\\server\apps\agy.exe"),
+        ] {
+            assert!(
+                super::owned_application(Path::new(executable), &[target.into()]),
+                "{target} -> {executable}"
+            );
+        }
+        assert!(!super::owned_application(
+            Path::new(r"C:\Other\agy.exe"),
+            &[r"\\?\C:\Tools\agy.exe".into()]
+        ));
+    }
+
     #[test]
     fn cli_and_helpers_are_scoped_to_the_selected_installation() {
         use std::path::Path;
@@ -371,13 +615,12 @@ class P { static void Main(string[] args) { File.WriteAllText(args[0], "ready");
         }
         assert!(ready_files.iter().all(|p| p.exists()));
         assert!(!super::holders(&[exe.clone()]).unwrap().is_empty());
-        assert_eq!(
-            super::running_applications(&executables[..3])
-                .unwrap()
-                .len(),
-            3
-        );
-        super::close_application(&executables[..3]).unwrap();
+        let targets: Vec<_> = executables[..3]
+            .iter()
+            .map(|path| fs::canonicalize(path).unwrap())
+            .collect();
+        assert_eq!(super::running_applications(&targets).unwrap().len(), 3);
+        super::close_application(&targets).unwrap();
         for child in &mut children[..3] {
             assert!(child.0.try_wait().unwrap().is_some());
         }

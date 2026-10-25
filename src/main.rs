@@ -5,8 +5,6 @@ mod net;
 mod system;
 mod ui;
 
-use std::env;
-
 fn print_help() {
     println!(
         "ANTIGRAVITY-BYPASS-RUSSIA (v{})\n\
@@ -29,7 +27,12 @@ fn print_help() {
 }
 
 fn main() {
-    let args: Vec<String> = env::args().collect();
+    #[cfg(any(windows, target_os = "macos"))]
+    if let Err(error) = system::user_context::initialize() {
+        eprintln!("Не удалось определить профиль пользователя: {error}");
+        std::process::exit(1);
+    }
+    let args: Vec<String> = system::env::args().collect();
     let command = args.get(1).map(String::as_str).unwrap_or("");
     #[cfg(target_os = "macos")]
     if command == "--endpoint-session" {

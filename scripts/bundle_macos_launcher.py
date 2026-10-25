@@ -41,5 +41,5 @@ if __name__ == "__main__":
     parser.add_argument("--x64", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
-    args.output.write_text(bundle(args.arm64.read_bytes(), args.x64.read_bytes()), encoding="utf-8", newline="\n")
+    args.output.write_bytes(bundle(args.arm64.read_bytes(), args.x64.read_bytes()).encode("utf-8"))
     args.output.chmod(0o755)

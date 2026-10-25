@@ -37,12 +37,13 @@ mod windows {
         )
     }
     fn read() -> Result<Option<Value>, String> {
+        let (user_hive, environment) = crate::system::user_context::environment_key();
         let mut kind = 0;
         let mut length = 0;
         let code = unsafe {
             RegGetValueW(
-                HKEY_CURRENT_USER,
-                wide("Environment").as_ptr(),
+                user_hive,
+                environment.as_ptr(),
                 wide("CLOUD_CODE_URL").as_ptr(),
                 RRF_RT_ANY | RRF_NOEXPAND,
                 &mut kind,
@@ -59,8 +60,8 @@ mod windows {
         let mut data = vec![0u8; length as usize];
         let code = unsafe {
             RegGetValueW(
-                HKEY_CURRENT_USER,
-                wide("Environment").as_ptr(),
+                user_hive,
+                environment.as_ptr(),
                 wide("CLOUD_CODE_URL").as_ptr(),
                 RRF_RT_ANY | RRF_NOEXPAND,
                 &mut kind,
@@ -75,11 +76,12 @@ mod windows {
         Ok(Some(Value { kind, data }))
     }
     fn write(value: Option<&Value>) -> Result<(), String> {
+        let (user_hive, environment) = crate::system::user_context::environment_key();
         let mut key = std::ptr::null_mut();
         let code = unsafe {
             RegCreateKeyExW(
-                HKEY_CURRENT_USER,
-                wide("Environment").as_ptr(),
+                user_hive,
+                environment.as_ptr(),
                 0,
                 std::ptr::null(),
                 0,

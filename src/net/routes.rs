@@ -56,50 +56,84 @@ pub fn sync_physical_hosts(extra: &[Ipv4Addr]) -> Result<(), String> {
         let (interface, gateway) =
             super::egress::detect_physical().ok_or("Не найден физический адаптер")?;
         let gateway: Ipv4Addr = gateway.parse().map_err(|_| "Некорректный шлюз")?;
-        let mut owned = load()?;
-        let mut ips: Vec<Ipv4Addr> = super::resolvers::all_provider_v4()
-            .iter()
-            .filter_map(|s| s.parse().ok())
-            .collect();
-        ips.extend(extra);
-        // Bootstrap HTTPS DNS through the same physical route, without asking
-        // the VPN's system resolver how to reach the DoH provider.
-        ips.extend(super::resolver_pool::bootstrap_v4()?);
-        ips.sort();
-        ips.dedup();
-        for ip in ips {
-            let route = OwnedRoute {
-                ip,
-                gateway,
-                interface,
-            };
-            match powershell(&inspect_route_script(&route, &owned))?.as_str() {
-                "present" => continue,
-                "owned-stale" => {
-                    // Move only exact recorded routes when Wi-Fi/gateway changes.
-                    let retired: Vec<_> = owned
-                        .iter()
-                        .filter(|r| r.ip == ip && *r != &route)
-                        .cloned()
-                        .collect();
-                    for old in retired {
-                        powershell(&remove_route_script(&old))?;
-                        owned.retain(|r| r != &old);
-                        save(&owned)?;
-                    }
-                }
-                "missing" => {}
-                _ => return Err("Не удалось проверить существующий маршрут".into()),
-            }
-            if !owned.contains(&route) {
-                owned.push(route.clone());
-                save(&owned)?;
-            }
-            powershell(&format!("$ErrorActionPreference='Stop'; New-NetRoute -DestinationPrefix '{ip}/32' -InterfaceIndex {interface} -NextHop '{gateway}' -RouteMetric 1 -PolicyStore ActiveStore | Out-Null"))?;
-        }
+        sync_physical_hosts_on(interface, gateway, extra)?;
     }
     #[cfg(not(target_os = "windows"))]
     let _ = extra;
+    Ok(())
+}
+
+/// ActiveStore is cleared at boot. Rebuild the recorded destinations against
+/// today's physical gateway, retaining the same ownership checks as setup.
+#[cfg(windows)]
+pub(super) fn restore_recorded_routes(interface: u32, gateway: Ipv4Addr) -> Result<(), String> {
+    let owned = load()?;
+    if !owned.is_empty() {
+        let destinations: Vec<_> = owned.iter().map(|route| route.ip).collect();
+        sync_physical_hosts_on(interface, gateway, &destinations)?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn sync_physical_hosts_on(
+    interface: u32,
+    gateway: Ipv4Addr,
+    extra: &[Ipv4Addr],
+) -> Result<(), String> {
+    if interface == 0 || gateway.is_unspecified() {
+        return Err("Не найден физический выход в интернет".into());
+    }
+    let mut owned = load()?;
+    let mut ips: Vec<Ipv4Addr> = super::resolvers::all_provider_v4()
+        .iter()
+        .filter_map(|s| s.parse().ok())
+        .collect();
+    ips.extend(extra);
+    // Bootstrap HTTPS DNS through the same physical route, without asking
+    // the VPN's system resolver how to reach the DoH provider.
+    ips.extend(super::resolver_pool::bootstrap_v4()?);
+    ips.sort();
+    ips.dedup();
+    for ip in ips {
+        let route = OwnedRoute {
+            ip,
+            gateway,
+            interface,
+        };
+        match powershell(&inspect_route_script(&route, &owned))?.as_str() {
+            "present" => continue,
+            "foreign" => {
+                // A different bypass may deliberately route this provider
+                // through its tunnel. Preserve that route and let the DNS
+                // and TLS probes decide whether this candidate is usable.
+                super::relay::log_event(&format!(
+                    "Существующий маршрут {ip}/32 сохранён; проверяем доступность по текущему пути"
+                ));
+                continue;
+            }
+            "owned-stale" => {
+                // Move only exact recorded routes when Wi-Fi/gateway changes.
+                let retired: Vec<_> = owned
+                    .iter()
+                    .filter(|r| r.ip == ip && *r != &route)
+                    .cloned()
+                    .collect();
+                for old in retired {
+                    powershell(&remove_route_script(&old))?;
+                    owned.retain(|r| r != &old);
+                    save(&owned)?;
+                }
+            }
+            "missing" => {}
+            _ => return Err("Не удалось проверить существующий маршрут".into()),
+        }
+        if !owned.contains(&route) {
+            owned.push(route.clone());
+            save(&owned)?;
+        }
+        powershell(&format!("$ErrorActionPreference='Stop'; New-NetRoute -DestinationPrefix '{ip}/32' -InterfaceIndex {interface} -NextHop '{gateway}' -RouteMetric 1 -PolicyStore ActiveStore | Out-Null"))?;
+    }
     Ok(())
 }
 
@@ -120,7 +154,7 @@ fn inspect_route_script(route: &OwnedRoute, owned: &[OwnedRoute]) -> String {
     } else {
         predicates.join(" -or ")
     };
-    format!("$r=@(Get-NetRoute -AddressFamily IPv4 -PolicyStore ActiveStore -ErrorAction Stop | Where-Object {{ $_.DestinationPrefix -eq '{}/32' }}); if ($r.Count -eq 0) {{ 'missing' }} elseif (@($r | Where-Object {{ $_.InterfaceIndex -eq {} -and $_.NextHop -eq '{}' }}).Count -gt 0) {{ 'present' }} elseif (@($r | Where-Object {{ -not ({tracked}) }}).Count -eq 0) {{ 'owned-stale' }} else {{ throw 'Конфликт существующего маршрута {}/32; он сохранён' }}", route.ip, route.interface, route.gateway, route.ip)
+    format!("$r=@(Get-NetRoute -AddressFamily IPv4 -PolicyStore ActiveStore -ErrorAction Stop | Where-Object {{ $_.DestinationPrefix -eq '{}/32' }}); if ($r.Count -eq 0) {{ 'missing' }} elseif (@($r | Where-Object {{ $_.InterfaceIndex -eq {} -and $_.NextHop -eq '{}' }}).Count -gt 0) {{ 'present' }} elseif (@($r | Where-Object {{ -not ({tracked}) }}).Count -eq 0) {{ 'owned-stale' }} else {{ 'foreign' }}", route.ip, route.interface, route.gateway)
 }
 pub fn add_static_routes() -> Result<(), String> {
     sync_physical_hosts(&[])
@@ -163,8 +197,8 @@ mod tests {
         for (interface, gateway, metric, expected) in [
             (7, "192.0.2.1", 1, Some("owned-stale")),
             (9, "192.0.2.254", 1, Some("present")),
-            (7, "192.0.2.1", 99, None),
-            (8, "192.0.2.1", 1, None),
+            (7, "192.0.2.1", 99, Some("foreign")),
+            (8, "192.0.2.1", 1, Some("foreign")),
         ] {
             let script = format!("function Get-NetRoute {{ param($AddressFamily,$PolicyStore,$ErrorAction) [pscustomobject]@{{DestinationPrefix='192.0.2.25/32';InterfaceIndex={interface};NextHop='{gateway}';RouteMetric={metric}}} }}; {}", inspect_route_script(&desired, &[old.clone()]));
             let result = powershell(&script);
@@ -179,6 +213,66 @@ mod tests {
             ip: "192.0.2.25".parse().unwrap(),
             gateway: "192.0.2.1".parse().unwrap(),
             interface: 7,
+        }
+    }
+
+    #[test]
+    fn mixed_foreign_and_owned_stale_routes_are_preserved() {
+        let old = route();
+        let desired = OwnedRoute {
+            interface: 9,
+            gateway: "192.0.2.254".parse().unwrap(),
+            ..old.clone()
+        };
+        for reverse in ["$true", "$false"] {
+            let script = format!(
+                r#"
+$script:routes=@(
+    [pscustomobject]@{{DestinationPrefix='192.0.2.25/32';InterfaceIndex=7;NextHop='192.0.2.1';RouteMetric=1}},
+    [pscustomobject]@{{DestinationPrefix='192.0.2.25/32';InterfaceIndex=8;NextHop='192.0.2.2';RouteMetric=5}}
+)
+if ({reverse}) {{ [array]::Reverse($script:routes) }}
+function Get-NetRoute {{ param($AddressFamily,$PolicyStore,$ErrorAction) $script:routes }}
+function Remove-NetRoute {{ throw 'unexpected route deletion' }}
+function New-NetRoute {{ throw 'unexpected route creation' }}
+{}
+'remaining=' + $script:routes.Count
+"#,
+                inspect_route_script(&desired, &[old.clone()])
+            );
+            let lines: Vec<_> = powershell(&script)
+                .unwrap()
+                .lines()
+                .map(str::to_owned)
+                .collect();
+            assert_eq!(lines, ["foreign", "remaining=2"]);
+        }
+    }
+
+    #[test]
+    fn existing_desired_route_and_foreign_route_are_both_preserved() {
+        for reverse in ["$true", "$false"] {
+            let script = format!(
+                r#"
+$script:routes=@(
+    [pscustomobject]@{{DestinationPrefix='192.0.2.25/32';InterfaceIndex=7;NextHop='192.0.2.1';RouteMetric=1}},
+    [pscustomobject]@{{DestinationPrefix='192.0.2.25/32';InterfaceIndex=8;NextHop='192.0.2.2';RouteMetric=5}}
+)
+if ({reverse}) {{ [array]::Reverse($script:routes) }}
+function Get-NetRoute {{ param($AddressFamily,$PolicyStore,$ErrorAction) $script:routes }}
+function Remove-NetRoute {{ throw 'unexpected route deletion' }}
+function New-NetRoute {{ throw 'unexpected route creation' }}
+{}
+'remaining=' + $script:routes.Count
+"#,
+                inspect_route_script(&route(), &[])
+            );
+            let lines: Vec<_> = powershell(&script)
+                .unwrap()
+                .lines()
+                .map(str::to_owned)
+                .collect();
+            assert_eq!(lines, ["present", "remaining=2"]);
         }
     }
 
@@ -210,11 +304,15 @@ function Remove-NetRoute {{ [CmdletBinding(SupportsShouldProcess)]param([Paramet
 
     #[test]
     fn real_query_failure_is_not_reported_as_success() {
-        let script = format!(
-            "function Get-NetRoute {{ throw 'Не удалось прочитать маршруты' }}; {}",
-            remove_route_script(&route())
-        );
-        let error = powershell(&script).unwrap_err();
-        assert!(error.contains("Не удалось прочитать маршруты"), "{error}");
+        for check in [
+            inspect_route_script(&route(), &[]),
+            remove_route_script(&route()),
+        ] {
+            let script = format!(
+                "function Get-NetRoute {{ throw 'Не удалось прочитать маршруты' }}; function Remove-NetRoute {{ throw 'unexpected route deletion' }}; function New-NetRoute {{ throw 'unexpected route creation' }}; {check}"
+            );
+            let error = powershell(&script).unwrap_err();
+            assert!(error.contains("Не удалось прочитать маршруты"), "{error}");
+        }
     }
 }

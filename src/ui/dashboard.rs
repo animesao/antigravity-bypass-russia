@@ -18,6 +18,9 @@ pub fn banner() {
 pub fn print_dashboard() {
     let (rules, _, _) = crate::net::nrpt::get_nrpt_status_info();
     let running = crate::system::service::running_state();
+    let hosts_count = crate::net::hosts::owned_entries()
+        .ok()
+        .map(|entries| entries.len());
     let status = get_quick_status();
     let title = " ТЕКУЩИЙ СТАТУС ";
     let left = (67 - title.chars().count()) / 2;
@@ -29,15 +32,7 @@ pub fn print_dashboard() {
         "─".repeat(right)
     );
     println!("\x1b[90m│{}│\x1b[0m", " ".repeat(67));
-    let network = if running.is_err() {
-        "\x1b[93mНе удалось проверить службу\x1b[0m"
-    } else if rules > 0 && running == Ok(true) {
-        "\x1b[92mВключён\x1b[0m"
-    } else if rules > 0 {
-        "\x1b[93mНужна проверка\x1b[0m"
-    } else {
-        "\x1b[90mВыключен\x1b[0m"
-    };
+    let network = network_status(rules, running.ok(), hosts_count);
     status_row("Обход:", network);
     status_row("Antigravity:", component_status(status.core_status));
     let ide = if !status.incomplete_ide_installations.is_empty() {
@@ -66,6 +61,52 @@ pub fn print_dashboard() {
     );
     println!("\x1b[90m│{}│\x1b[0m", " ".repeat(67));
     println!("\x1b[90m╰{}╯\x1b[0m\n", "─".repeat(67));
+}
+
+fn network_status(
+    rules: usize,
+    service_running: Option<bool>,
+    hosts_count: Option<usize>,
+) -> &'static str {
+    match hosts_count {
+        Some(count) if count == crate::net::provider::NRPT_AGENT.len() => {
+            // Pins describe complete installed Agent coverage; no connection
+            // probe ran here. A running process or a single DNS rule alone
+            // cannot establish that the remaining domains were configured.
+            return "\x1b[92mНастроен (hosts)\x1b[0m";
+        }
+        Some(count) if count > 0 => return "\x1b[93mНужна проверка (hosts)\x1b[0m",
+        None => return "\x1b[93mНе удалось проверить hosts\x1b[0m",
+        _ => {}
+    }
+    match (rules, service_running) {
+        (_, None) => "\x1b[93mНе удалось проверить службу\x1b[0m",
+        (count, _) if count > 0 => "\x1b[93mНужна проверка\x1b[0m",
+        (_, Some(true)) => "\x1b[93mНужна проверка\x1b[0m",
+        _ => "\x1b[90mВыключен\x1b[0m",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::network_status;
+
+    #[test]
+    fn hosts_configuration_does_not_require_a_relay_or_mask_partial_pins() {
+        let complete = crate::net::provider::NRPT_AGENT.len();
+        for service in [Some(true), Some(false), None] {
+            for rules in [0, 1, 30] {
+                assert!(network_status(rules, service, Some(complete)).contains("Настроен (hosts)"));
+                assert!(network_status(rules, service, Some(1)).contains("Нужна проверка (hosts)"));
+                assert!(network_status(rules, service, None).contains("Не удалось проверить hosts"));
+            }
+        }
+        assert!(network_status(0, Some(false), Some(0)).contains("Выключен"));
+        assert!(network_status(1, Some(true), Some(0)).contains("Нужна проверка"));
+        assert!(network_status(0, Some(true), Some(0)).contains("Нужна проверка"));
+        assert!(network_status(1, Some(false), Some(0)).contains("Нужна проверка"));
+        assert!(network_status(1, None, Some(0)).contains("Не удалось проверить службу"));
+    }
 }
 
 fn component_status(status: Option<BinaryState>) -> &'static str {

@@ -2,6 +2,7 @@ name: Regression checks
 
 on:
   pull_request:
+  workflow_dispatch:
   push:
     branches: [main, 'fix/**']
 
@@ -37,6 +38,8 @@ jobs:
           python-version: '3.12'
       - name: Isolated regression tests
         run: cargo test --locked --bin antigravity-bypass-russia --target ${{ matrix.target }}
+      - name: Socket regression tests
+        run: cargo test --locked --test socket_tests --target ${{ matrix.target }}
       - name: Official CLI profiles and rollback
         run: python tests/verify_cli_profiles.py --target ${{ matrix.target }}
       - name: Launcher compatibility
@@ -49,3 +52,15 @@ jobs:
         run: cargo build --locked --bin antigravity-bypass-russia --target ${{ matrix.target }}
       - name: Read-only CLI and diagnostic export
         run: python tests/verify_release.py target/${{ matrix.target }}/debug/antigravity-bypass-russia${{ runner.os == 'Windows' && '.exe' || '' }}
+      - name: Install Python 3.9 for packaging compatibility
+        if: runner.os == 'Windows'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+      - name: Python 3.9 launcher and packaging checks
+        if: runner.os == 'Windows'
+        run: |
+          foreach ($check in @('verify_macos_bundle.py', 'verify_macos_source_bundle.py', 'verify_wrappers.py')) {
+            python "tests/$check"
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }

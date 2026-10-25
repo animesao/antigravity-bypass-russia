@@ -51,7 +51,7 @@ pub fn prompt(text: &str) -> String {
 }
 
 pub fn pause() {
-    if std::env::args().len() > 1 {
+    if crate::system::env::args().len() > 1 {
         return;
     }
     println!();

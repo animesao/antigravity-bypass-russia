@@ -1,5 +1,13 @@
 use std::path::{Path, PathBuf};
 
+/// Public command arguments, excluding the validated elevation handoff.
+pub fn args() -> std::vec::IntoIter<String> {
+    #[cfg(any(windows, target_os = "macos"))]
+    return super::user_context::args();
+    #[cfg(not(any(windows, target_os = "macos")))]
+    std::env::args().collect::<Vec<_>>().into_iter()
+}
+
 /// User-facing spelling only; filesystem operations retain the original path.
 pub fn display_path(path: &Path) -> String {
     let text = path.to_string_lossy();
@@ -40,16 +48,24 @@ pub fn expand_env_vars(input: &str) -> PathBuf {
             .collect();
         let mut wide_out = vec![0u16; 4096];
 
-        unsafe {
-            let len = ExpandEnvironmentStringsW(
-                wide_in.as_ptr(),
-                wide_out.as_mut_ptr(),
-                wide_out.len() as u32,
-            );
-            if len > 0 && (len as usize) < wide_out.len() {
+        // The API returns the required size, including the final NUL. Retry
+        // with that capacity rather than returning an unexpanded long path.
+        for _ in 0..3 {
+            let len = unsafe {
+                ExpandEnvironmentStringsW(
+                    wide_in.as_ptr(),
+                    wide_out.as_mut_ptr(),
+                    wide_out.len() as u32,
+                )
+            } as usize;
+            if len == 0 || len > 32768 {
+                break;
+            }
+            if len <= wide_out.len() {
                 wide_out.truncate(len as usize - 1);
                 return PathBuf::from(std::ffi::OsString::from_wide(&wide_out));
             }
+            wide_out.resize(len, 0);
         }
     }
 
@@ -59,26 +75,11 @@ pub fn expand_env_vars(input: &str) -> PathBuf {
             let subpath = if input.len() > 2 { &input[2..] } else { "" };
             #[cfg(target_os = "macos")]
             {
-                if let Ok(sudo_user) = std::env::var("SUDO_USER") {
-                    if !sudo_user.is_empty() && sudo_user != "root" {
-                        let user_home = PathBuf::from(format!("/Users/{}", sudo_user));
-                        if user_home.exists() {
-                            return user_home.join(subpath);
-                        }
-                    }
+                if let Ok(home) = super::user_context::home() {
+                    return home.join(subpath);
                 }
-                // When elevated via GUI / osascript, query the active console user
-                if let Ok(out) =
-                    crate::system::command::output("stat", ["-f", "%Su", "/dev/console"])
-                {
-                    let user = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                    if !user.is_empty() && user != "root" {
-                        let user_home = PathBuf::from(format!("/Users/{}", user));
-                        if user_home.exists() {
-                            return user_home.join(subpath);
-                        }
-                    }
-                }
+                // Never silently write a failed user lookup into root's HOME.
+                return PathBuf::from(input);
             }
             #[cfg(all(unix, not(target_os = "macos")))]
             {
@@ -91,6 +92,7 @@ pub fn expand_env_vars(input: &str) -> PathBuf {
                     }
                 }
             }
+            #[cfg(not(target_os = "macos"))]
             if let Ok(home) = std::env::var("HOME") {
                 return PathBuf::from(home).join(subpath);
             }
@@ -137,22 +139,8 @@ pub fn get_user_homes() -> Vec<PathBuf> {
     {
         #[cfg(target_os = "macos")]
         {
-            if let Ok(sudo_user) = std::env::var("SUDO_USER") {
-                if !sudo_user.is_empty() && sudo_user != "root" {
-                    let p = PathBuf::from(format!("/Users/{}", sudo_user));
-                    if p.exists() && !homes.contains(&p) {
-                        homes.push(p);
-                    }
-                }
-            }
-            if let Ok(out) = crate::system::command::output("stat", ["-f", "%Su", "/dev/console"]) {
-                let user = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if !user.is_empty() && user != "root" {
-                    let p = PathBuf::from(format!("/Users/{}", user));
-                    if p.exists() && !homes.contains(&p) {
-                        homes.push(p);
-                    }
-                }
+            if let Ok(home) = super::user_context::home() {
+                homes.push(home);
             }
         }
         #[cfg(not(target_os = "macos"))]
@@ -166,6 +154,7 @@ pub fn get_user_homes() -> Vec<PathBuf> {
                 }
             }
         }
+        #[cfg(not(target_os = "macos"))]
         if let Ok(h) = std::env::var("HOME") {
             let p = PathBuf::from(h);
             if !homes.contains(&p) && p != PathBuf::from("/var/root") && p != PathBuf::from("/root")
@@ -175,4 +164,24 @@ pub fn get_user_homes() -> Vec<PathBuf> {
         }
     }
     homes
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expands_variables_when_the_result_reaches_or_exceeds_the_initial_buffer() {
+        let variable = "SystemRoot";
+        let value = std::env::var(variable).unwrap();
+        for characters in [4095, 5000] {
+            let suffix = "x".repeat(characters - value.encode_utf16().count());
+            let input = format!("%{variable}%{suffix}");
+            let expected = PathBuf::from(format!("{value}{suffix}"));
+            assert!(
+                expand_env_vars(&input) == expected,
+                "failed to expand a {characters}-character path"
+            );
+        }
+    }
 }

@@ -125,13 +125,27 @@ cli_endpoint.json
 # Local DNS settings, connection state and legacy network backups
 /network.json
 /network-user.json
+network-update.lock
+hosts-mode
 route-health.json
 route-health.lock
 tcp_backup.conf
 doh_backup.conf
 custom_upstream_proxy.conf
 
+# Diagnostic exports and interrupted file transactions
+antigravity-diagnostics-*.json
+.*.ag-transaction-*/
+hosts.antigravity-recovery-*
+ag_dns-update-*
+
 # Local project and testing notes
 /PROJECT.md
 /TEST_INFRA.md
 /TEST_READY.md
+
+# Local macOS builder (kept on the developer's machine)
+/build_macos.command
+/scripts/build_macos_release.sh
+/tests/verify_macos_builder.py
+/docs/macos-builder-local.md

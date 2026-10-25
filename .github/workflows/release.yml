@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -49,6 +49,9 @@ jobs:
       - name: Regression tests (isolated fixtures; destructive harnesses remain ignored)
         run: cargo test --locked --bin antigravity-bypass-russia --target ${{ matrix.target }}
 
+      - name: Socket regression tests
+        run: cargo test --locked --test socket_tests --target ${{ matrix.target }}
+
       - name: Official CLI profiles and rollback
         run: python tests/verify_cli_profiles.py --target ${{ matrix.target }}
 
@@ -70,18 +73,80 @@ jobs:
       - name: Prepare binary artifact
         run: python scripts/package_release.py --binary target/${{ matrix.target }}/release/${{ matrix.binary_name }} --target ${{ matrix.target }}
 
+      - name: Install Python 3.9 for packaging compatibility
+        if: runner.os == 'Windows'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+
+      - name: Python 3.9 launcher and packaging checks
+        if: runner.os == 'Windows'
+        run: |
+          foreach ($check in @('verify_macos_bundle.py', 'verify_macos_source_bundle.py', 'verify_wrappers.py')) {
+            python "tests/$check"
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
       - name: Upload Build Artifact
         uses: actions/upload-artifact@v4
         with:
           name: binary-${{ matrix.target }}
           path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  package:
+    name: Package release candidate
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Download verified binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          path: dist/raw
+          merge-multiple: true
+
+      - name: Prepare Windows files
+        run: |
+          mkdir -p dist/release
+          cp dist/raw/antigravity-bypass-russia.exe dist/raw/unlock_and_restore.ps1 dist/release/
+
+      - name: Bundle native macOS engines
+        run: python scripts/bundle_macos_launcher.py --arm64 dist/raw/antigravity-bypass-russia-macos-arm64 --x64 dist/raw/antigravity-bypass-russia-macos-x64 --output dist/release/unlock_and_restore.sh
+
+      - name: Generate checksums
+        working-directory: dist/release
+        run: sha256sum antigravity-bypass-russia.exe unlock_and_restore.ps1 unlock_and_restore.sh > SHA256SUMS.txt
+
+      - name: Verify exact distribution contents and embedded engines
+        run: python tests/verify_distribution.py dist/release --engines dist/raw
+
+      - name: Upload release candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-candidate
+          path: dist/release/*
+          if-no-files-found: error
+          retention-days: 14
 
   release:
     name: Create GitHub Release
-    needs: build
+    needs: package
     runs-on: ubuntu-latest
     timeout-minutes: 15
     if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -89,11 +154,8 @@ jobs:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
+          name: release-candidate
           path: dist
-          merge-multiple: true
-
-      - name: Bundle macOS engines into one launcher
-        run: python3 scripts/bundle_macos_launcher.py --arm64 dist/antigravity-bypass-russia-macos-arm64 --x64 dist/antigravity-bypass-russia-macos-x64 --output dist/unlock_and_restore.sh
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
@@ -103,6 +165,7 @@ jobs:
             dist/antigravity-bypass-russia.exe
             dist/unlock_and_restore.ps1
             dist/unlock_and_restore.sh
+            dist/SHA256SUMS.txt
           body_path: docs/releases/${{ github.ref_name }}.md
           draft: true
           generate_release_notes: false

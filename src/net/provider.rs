@@ -59,7 +59,18 @@ pub const NRPT_AGENT: &[&str] = &[
 
 /// Geohide HTTP/SNI frontends. Used when VPN makes SmartDNS skip substitution:
 /// we still TLS-probe these with Cloud Code SNI and pin whoever answers.
-pub const GEOHIDE_PROXY_V4: &[&str] = &["37.230.192.51", "45.155.204.190"];
+/// Keep this in sync with the addresses published on geohide.ru/hosts: retired
+/// frontends reset TLS, and a stale seed list leaves `geohide.ru` enabled but
+/// unable to contribute a single candidate.
+pub const GEOHIDE_PROXY_V4: &[&str] = &[
+    "193.233.112.68",
+    "193.233.112.88",
+    "5.175.161.40",
+    "5.175.161.3",
+    "45.13.237.213",
+    "159.194.200.33",
+    "193.233.112.67",
+];
 
 pub fn nrpt_domains() -> Vec<&'static str> {
     let mut out = Vec::with_capacity(NRPT_AGENT.len() + NRPT_STUDIO.len());
