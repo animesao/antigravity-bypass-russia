@@ -30,6 +30,8 @@ jobs:
             target: x86_64-apple-darwin
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -38,9 +40,21 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Install Linux dependencies
-        if: runner.os == 'Linux'
+      - name: Install Linux dependencies (x86_64)
+        if: runner.os == 'Linux' && matrix.target == 'x86_64-unknown-linux-gnu'
         run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+      - name: Install Linux dependencies (ARM64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo dpkg --add-architecture arm64
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu libssl-dev:arm64 qemu-user qemu-user-static binfmt-support
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER=qemu-aarch64-static -L /usr/aarch64-linux-gnu -E LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu" >> $GITHUB_ENV
+          echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+          echo "PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig" >> $GITHUB_ENV
+          echo "PKG_CONFIG_ALLOW_CROSS=1" >> $GITHUB_ENV
+          echo "QEMU_LD_PREFIX=/usr/aarch64-linux-gnu" >> $GITHUB_ENV
       - name: Isolated regression tests
         run: cargo test --locked --bin antigravity-bypass-russia --target ${{ matrix.target }}
       - name: Socket regression tests

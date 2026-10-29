@@ -34,6 +34,10 @@ jobs:
             target: x86_64-unknown-linux-gnu
             binary_name: antigravity-bypass-russia
             release_name: antigravity-bypass-russia-linux-x64
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            binary_name: antigravity-bypass-russia
+            release_name: antigravity-bypass-russia-linux-arm64
 
     steps:
       - name: Checkout repository
@@ -44,9 +48,22 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install Linux dependencies
-        if: runner.os == 'Linux'
+      - name: Install Linux dependencies (x86_64)
+        if: runner.os == 'Linux' && matrix.target == 'x86_64-unknown-linux-gnu'
         run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+
+      - name: Install Linux ARM64 cross-compilation dependencies
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo dpkg --add-architecture arm64
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu libssl-dev:arm64 qemu-user qemu-user-static binfmt-support
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER=qemu-aarch64-static -L /usr/aarch64-linux-gnu -E LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu" >> $GITHUB_ENV
+          echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+          echo "PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig" >> $GITHUB_ENV
+          echo "PKG_CONFIG_ALLOW_CROSS=1" >> $GITHUB_ENV
+          echo "QEMU_LD_PREFIX=/usr/aarch64-linux-gnu" >> $GITHUB_ENV
 
       - name: Install Python
         uses: actions/setup-python@v5
@@ -128,17 +145,36 @@ jobs:
           mkdir -p dist/release
           cp dist/raw/antigravity-bypass-russia.exe dist/raw/unlock_and_restore.ps1 dist/release/
 
-      - name: Prepare Linux files
+      - name: Prepare Linux files and packages
         run: |
           mkdir -p dist/release
           cp dist/raw/antigravity-bypass-russia-linux-x64 dist/release/
+          cp dist/raw/antigravity-bypass-russia-linux-arm64 dist/release/
+          cp scripts/install.sh dist/release/
+
+          # Build .deb package for x86_64
+          mkdir -p dist/deb/DEBIAN dist/deb/usr/bin
+          cat > dist/deb/DEBIAN/control <<EOF
+Package: antigravity-bypass-russia
+Version: 2.6.0
+Section: utils
+Priority: optional
+Architecture: amd64
+Maintainer: animesao
+Homepage: https://github.com/animesao/antigravity-bypass-russia
+Description: Google Antigravity & Gemini bypass in Russia (No VPN, SmartDNS & SIMD Binary Patcher)
+EOF
+          cp dist/raw/antigravity-bypass-russia-linux-x64 dist/deb/usr/bin/antigravity-bypass-russia
+          chmod 755 dist/deb/usr/bin/antigravity-bypass-russia
+          ln -sf /usr/bin/antigravity-bypass-russia dist/deb/usr/bin/ag-bypass
+          dpkg-deb --build dist/deb dist/release/antigravity-bypass-russia-linux-x64.deb
 
       - name: Bundle native macOS engines
         run: python scripts/bundle_macos_launcher.py --arm64 dist/raw/antigravity-bypass-russia-macos-arm64 --x64 dist/raw/antigravity-bypass-russia-macos-x64 --output dist/release/unlock_and_restore.sh
 
       - name: Generate checksums
         working-directory: dist/release
-        run: sha256sum antigravity-bypass-russia.exe antigravity-bypass-russia-linux-x64 unlock_and_restore.ps1 unlock_and_restore.sh > SHA256SUMS.txt
+        run: sha256sum antigravity-bypass-russia.exe antigravity-bypass-russia-linux-x64 antigravity-bypass-russia-linux-arm64 antigravity-bypass-russia-linux-x64.deb unlock_and_restore.ps1 unlock_and_restore.sh install.sh > SHA256SUMS.txt
 
       - name: Verify exact distribution contents and embedded engines
         run: python tests/verify_distribution.py dist/release --engines dist/raw
@@ -176,8 +212,11 @@ jobs:
           files: |
             dist/antigravity-bypass-russia.exe
             dist/antigravity-bypass-russia-linux-x64
+            dist/antigravity-bypass-russia-linux-arm64
+            dist/antigravity-bypass-russia-linux-x64.deb
             dist/unlock_and_restore.ps1
             dist/unlock_and_restore.sh
+            dist/install.sh
           body_path: docs/releases/${{ github.ref_name }}.md
           draft: true
           generate_release_notes: false

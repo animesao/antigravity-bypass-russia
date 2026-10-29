@@ -20,13 +20,16 @@ directory = args.directory
 payload_names = {
     "antigravity-bypass-russia.exe",
     "antigravity-bypass-russia-linux-x64",
+    "antigravity-bypass-russia-linux-arm64",
+    "antigravity-bypass-russia-linux-x64.deb",
     "unlock_and_restore.ps1",
     "unlock_and_restore.sh",
+    "install.sh",
 }
 if args.macos_only:
     payload_names = {"antigravity-bypass-russia-macos-arm64", "antigravity-bypass-russia-macos-x64", "unlock_and_restore.sh"}
 elif args.linux_only:
-    payload_names = {"antigravity-bypass-russia-linux-x64", "unlock_and_restore.sh"}
+    payload_names = {"antigravity-bypass-russia-linux-x64", "antigravity-bypass-russia-linux-arm64", "unlock_and_restore.sh", "install.sh"}
 assert {p.name for p in directory.iterdir()} == payload_names | {"SHA256SUMS.txt"}, "Unexpected or missing distribution files"
 
 checksums = {}
@@ -52,6 +55,13 @@ if (directory / "antigravity-bypass-russia-linux-x64").is_file():
     assert elf[4] == 2, "Expected 64-bit ELF"
     assert elf[18:20] == b"\x3e\x00", "Expected x86-64 ELF"
     assert elf == (args.engines / "antigravity-bypass-russia-linux-x64").read_bytes(), "Linux engine changed during packaging"
+
+if (directory / "antigravity-bypass-russia-linux-arm64").is_file():
+    elf = (directory / "antigravity-bypass-russia-linux-arm64").read_bytes()
+    assert elf[:4] == b"\x7fELF", "Linux ARM64 engine is not ELF"
+    assert elf[4] == 2, "Expected 64-bit ELF"
+    assert elf[18:20] == b"\xb7\x00", "Expected AArch64 ELF"
+    assert elf == (args.engines / "antigravity-bypass-russia-linux-arm64").read_bytes(), "Linux ARM64 engine changed during packaging"
 
 launcher = directory / "unlock_and_restore.sh"
 script = launcher.read_bytes()

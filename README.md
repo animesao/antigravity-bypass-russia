@@ -109,17 +109,37 @@ chmod +x scripts/unlock_and_restore.sh
 
 ---
 
-### 🐧 Linux (Ubuntu, Debian, Fedora, Arch и др.)
+### 🐧 Linux (Ubuntu, Debian, Fedora, Arch Linux, ARM64 и др.)
 
-#### Вариант 1: Быстрый запуск бинарного файла (Рекомендуется)
-1. Откройте терминал и выполните команду для скачивания и запуска готового бинарного файла:
-   ```bash
-   curl -fsSL https://github.com/animesao/antigravity-bypass-russia/releases/latest/download/antigravity-bypass-russia-linux-x64 -o antigravity-bypass-russia && chmod +x antigravity-bypass-russia && ./antigravity-bypass-russia
-   ```
-2. В интерактивном меню введите **`1`** (**`Полная разблокировка`**) и нажмите **Enter**.
-3. Утилита снимет региональные ограничения, настроит маршрутизацию (systemd-служба `antigravity-bypass-russia.service` и `/etc/hosts`) и сбросит кэш DNS (`resolvectl`). При необходимости запросит права суперпользователя (`sudo` / `pkexec`).
+#### Вариант 1: Установка в один клик (Рекомендуется)
+Выполните команду автоматической установки в терминале:
+```bash
+curl -fsSL https://raw.githubusercontent.com/animesao/antigravity-bypass-russia/main/scripts/install.sh | bash
+```
+Скрипт автоматически определит вашу архитектуру (**x86_64** или **ARM64**), установит утилиту в систему и создаст команды:
+* `antigravity-bypass-russia`
+* `ag-bypass`
 
-#### Вариант 2: Запуск из репозитория
+Запустите утилиту командой `ag-bypass`, введите **`1`** (**`Полная разблокировка`**) и нажмите **Enter**.
+
+#### Вариант 2: Готовый пакет .deb или бинарный файл
+* **Пакет `.deb` (Ubuntu / Debian / Linux Mint):**  
+  Скачайте [**`antigravity-bypass-russia-linux-x64.deb`**](https://github.com/animesao/antigravity-bypass-russia/releases/latest) и установите:
+  ```bash
+  sudo dpkg -i antigravity-bypass-russia-linux-x64.deb
+  ```
+* **Прямой запуск бинарного файла:**
+  ```bash
+  # Для 64-битных ПК (x86_64):
+  curl -fsSL https://github.com/animesao/antigravity-bypass-russia/releases/latest/download/antigravity-bypass-russia-linux-x64 -o antigravity-bypass-russia && chmod +x antigravity-bypass-russia && ./antigravity-bypass-russia
+
+  # Для ARM64 (Raspberry Pi, Asahi Linux, ARM-серверы):
+  curl -fsSL https://github.com/animesao/antigravity-bypass-russia/releases/latest/download/antigravity-bypass-russia-linux-arm64 -o antigravity-bypass-russia && chmod +x antigravity-bypass-russia && ./antigravity-bypass-russia
+  ```
+* **Arch Linux / Manjaro:**  
+  В репозитории доступен [`packages/arch/PKGBUILD`](packages/arch/PKGBUILD) для быстрой сборки и установки через `makepkg -si`.
+
+#### Вариант 3: Запуск из репозитория
 <details>
 <summary><b>Инструкция для сборки из репозитория (требуется Rust)</b></summary>
 
