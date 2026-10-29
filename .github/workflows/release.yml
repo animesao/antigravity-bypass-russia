@@ -154,16 +154,7 @@ jobs:
 
           # Build .deb package for x86_64
           mkdir -p dist/deb/DEBIAN dist/deb/usr/bin
-          cat > dist/deb/DEBIAN/control <<EOF
-Package: antigravity-bypass-russia
-Version: 2.6.0
-Section: utils
-Priority: optional
-Architecture: amd64
-Maintainer: animesao
-Homepage: https://github.com/animesao/antigravity-bypass-russia
-Description: Google Antigravity & Gemini bypass in Russia (No VPN, SmartDNS & SIMD Binary Patcher)
-EOF
+          python -c 'open("dist/deb/DEBIAN/control", "w").write("Package: antigravity-bypass-russia\nVersion: 2.6.0\nSection: utils\nPriority: optional\nArchitecture: amd64\nMaintainer: animesao\nHomepage: https://github.com/animesao/antigravity-bypass-russia\nDescription: Google Antigravity & Gemini bypass in Russia (No VPN, SmartDNS & SIMD Binary Patcher)\n")'
           cp dist/raw/antigravity-bypass-russia-linux-x64 dist/deb/usr/bin/antigravity-bypass-russia
           chmod 755 dist/deb/usr/bin/antigravity-bypass-russia
           ln -sf /usr/bin/antigravity-bypass-russia dist/deb/usr/bin/ag-bypass
