@@ -339,7 +339,7 @@ pub(super) fn flush_dns_cache() -> Result<(), String> {
     ];
     #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     let commands: &[(&str, &[&str])] = &[];
-    let mut errors = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
     for (program, args) in commands {
         match crate::system::command::output(program, *args) {
             Ok(out) if out.status.success() => {}
@@ -576,6 +576,8 @@ pub fn apply_dns_rules() -> Result<NetworkSetup, String> {
             sub_notes.push(format!("Studio/Gemini: {}", studio_subs.join(", ")));
         }
     }
+    let _ = (&agent_rules, &studio_subs);
+    #[cfg(not(target_os = "linux"))]
     let agent_rules: Vec<_> = agent_rules
         .iter()
         .map(|(name, servers)| {
@@ -585,6 +587,7 @@ pub fn apply_dns_rules() -> Result<NetworkSetup, String> {
             )
         })
         .collect();
+    #[cfg(not(target_os = "linux"))]
     let studio_subs: Vec<_> = studio_subs.iter().map(String::as_str).collect();
     // Reject invalid or conflicting resolver plans before ranking writes hosts
     // or setup changes the service. Applying later rechecks file ownership.

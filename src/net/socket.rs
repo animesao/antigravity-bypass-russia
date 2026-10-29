@@ -851,6 +851,7 @@ fn read_legacy_heuristics() -> Option<String> {
 fn restore_legacy_tcp() -> Result<Vec<String>, String> {
     let original =
         parse_legacy_tcp(&fs::read_to_string(tcp_backup_path()).map_err(|e| e.to_string())?)?;
+    #[allow(unused_mut)]
     let mut current = capture_tcp()?.original;
     #[cfg(windows)]
     if let Some(value) = read_legacy_heuristics() {
@@ -876,6 +877,7 @@ fn restore_legacy_tcp() -> Result<Vec<String>, String> {
             unresolved.push(e);
         }
     }
+    #[allow(unused_mut)]
     let mut after = capture_tcp()?.original;
     #[cfg(windows)]
     if let Some(value) = read_legacy_heuristics() {
