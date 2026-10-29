@@ -30,7 +30,10 @@ jobs:
             target: x86_64-apple-darwin
             binary_name: antigravity-bypass-russia
             release_name: antigravity-bypass-russia-macos-x64
-
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary_name: antigravity-bypass-russia
+            release_name: antigravity-bypass-russia-linux-x64
 
     steps:
       - name: Checkout repository
@@ -40,6 +43,10 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
 
       - name: Install Python
         uses: actions/setup-python@v5
@@ -121,12 +128,17 @@ jobs:
           mkdir -p dist/release
           cp dist/raw/antigravity-bypass-russia.exe dist/raw/unlock_and_restore.ps1 dist/release/
 
+      - name: Prepare Linux files
+        run: |
+          mkdir -p dist/release
+          cp dist/raw/antigravity-bypass-russia-linux-x64 dist/release/
+
       - name: Bundle native macOS engines
         run: python scripts/bundle_macos_launcher.py --arm64 dist/raw/antigravity-bypass-russia-macos-arm64 --x64 dist/raw/antigravity-bypass-russia-macos-x64 --output dist/release/unlock_and_restore.sh
 
       - name: Generate checksums
         working-directory: dist/release
-        run: sha256sum antigravity-bypass-russia.exe unlock_and_restore.ps1 unlock_and_restore.sh > SHA256SUMS.txt
+        run: sha256sum antigravity-bypass-russia.exe antigravity-bypass-russia-linux-x64 unlock_and_restore.ps1 unlock_and_restore.sh > SHA256SUMS.txt
 
       - name: Verify exact distribution contents and embedded engines
         run: python tests/verify_distribution.py dist/release --engines dist/raw
@@ -163,6 +175,7 @@ jobs:
         with:
           files: |
             dist/antigravity-bypass-russia.exe
+            dist/antigravity-bypass-russia-linux-x64
             dist/unlock_and_restore.ps1
             dist/unlock_and_restore.sh
           body_path: docs/releases/${{ github.ref_name }}.md

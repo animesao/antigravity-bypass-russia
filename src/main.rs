@@ -27,7 +27,7 @@ fn print_help() {
 }
 
 fn main() {
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, unix))]
     if let Err(error) = system::user_context::initialize() {
         eprintln!("Не удалось определить профиль пользователя: {error}");
         std::process::exit(1);

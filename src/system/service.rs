@@ -8,6 +8,8 @@ pub const FORWARDER_FLAG: &str = "--dns-forwarder";
 pub const TASK_NAME: &str = "AntigravityBypassRussia";
 pub const LAUNCHD_LABEL: &str = "com.antigravity.bypass.russia";
 pub const LAUNCHD_PLIST: &str = "/Library/LaunchDaemons/com.antigravity.bypass.russia.plist";
+pub const SYSTEMD_SERVICE: &str = "/etc/systemd/system/antigravity-bypass-russia.service";
+pub const SYSTEMD_LABEL: &str = "antigravity-bypass-russia";
 pub const EXE_NAME: &str = if cfg!(target_os = "windows") {
     "ag_dns.exe"
 } else {
@@ -228,7 +230,7 @@ pub fn registered_state() -> Result<bool, String> {
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        Ok(false)
+        Ok(Path::new(SYSTEMD_SERVICE).exists())
     }
 }
 
@@ -636,6 +638,36 @@ pub fn enable() -> Result<(), String> {
         }
     }
 
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let unit_content = format!(
+            "[Unit]\n\
+            Description=Antigravity Bypass Russia DNS Forwarder\n\
+            After=network.target\n\n\
+            [Service]\n\
+            Type=simple\n\
+            ExecStart={} {}\n\
+            Restart=on-failure\n\
+            RestartSec=5\n\n\
+            [Install]\n\
+            WantedBy=multi-user.target\n",
+            dst.display(),
+            FORWARDER_FLAG
+        );
+
+        if let Ok(()) = crate::system::fs_utils::robust_write_file(
+            Path::new(SYSTEMD_SERVICE),
+            unit_content.as_bytes(),
+        ) {
+            let _ = crate::system::command::output("systemctl", ["daemon-reload"]);
+            let _ = crate::system::command::output("systemctl", ["enable", "--now", SYSTEMD_LABEL]);
+        } else {
+            let _ = std::process::Command::new(&dst)
+                .arg(FORWARDER_FLAG)
+                .spawn();
+        }
+    }
+
     Ok(())
 }
 
@@ -680,7 +712,18 @@ pub fn start() -> Result<(), String> {
         }
     }
     #[cfg(all(unix, not(target_os = "macos")))]
-    Ok(())
+    {
+        let out = crate::system::command::output("systemctl", ["start", SYSTEMD_LABEL])
+            .map_err(|e| format!("Ошибка systemctl: {}", e))?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            let _ = std::process::Command::new(installed_exe())
+                .arg(FORWARDER_FLAG)
+                .spawn();
+            Ok(())
+        }
+    }
 }
 
 pub fn disable() -> Result<(), String> {
@@ -698,6 +741,15 @@ pub fn disable() -> Result<(), String> {
         unload_mac_job()?;
         if Path::new(LAUNCHD_PLIST).exists() {
             fs::remove_file(LAUNCHD_PLIST).map_err(|e| format!("Удаление plist: {e}"))?;
+        }
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let _ = crate::system::command::output("systemctl", ["stop", SYSTEMD_LABEL]);
+        let _ = crate::system::command::output("systemctl", ["disable", SYSTEMD_LABEL]);
+        if Path::new(SYSTEMD_SERVICE).exists() {
+            let _ = fs::remove_file(SYSTEMD_SERVICE);
+            let _ = crate::system::command::output("systemctl", ["daemon-reload"]);
         }
     }
 

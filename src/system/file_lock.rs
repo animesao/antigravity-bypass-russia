@@ -9,7 +9,14 @@ pub fn holders(paths: &[PathBuf]) -> Result<Vec<String>, String> {
 pub fn close_application(paths: &[PathBuf]) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     return crate::system::macos_shutdown::close_application(paths);
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        crate::system::process::stop_process_by_name("antigravity");
+        crate::system::process::stop_process_by_name("antigravity-ide");
+        crate::system::process::stop_process_by_name("agy");
+        return wait_for_holders_to_exit(|| holders(paths), std::time::Duration::from_secs(5));
+    }
+    #[cfg(not(any(windows, unix)))]
     return wait_for_holders_to_exit(|| holders(paths), std::time::Duration::from_secs(5));
     #[cfg(windows)]
     {
@@ -264,33 +271,35 @@ fn query(paths: &[PathBuf]) -> Result<Vec<String>, String> {
         }
         Err("Список процессов меняется; повторите проверку".into())
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     {
         if paths.is_empty() {
             return Ok(vec![]);
         }
-        let output = crate::system::command::output(
+        let output = match crate::system::command::output(
             "lsof",
             ["-n", "-P", "-Fpc", "--"]
                 .into_iter()
                 .map(std::ffi::OsStr::new)
                 .chain(paths.iter().map(|p| p.as_os_str())),
-        )
-        .map_err(|e| format!("Проверка открытых файлов: {e}"))?;
+        ) {
+            Ok(out) => out,
+            Err(_) => return Ok(vec![]),
+        };
         parse_lsof(
             output.status.code(),
             &String::from_utf8_lossy(&output.stdout),
             &String::from_utf8_lossy(&output.stderr),
         )
     }
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(not(any(windows, unix)))]
     {
         let _ = paths;
         Ok(vec![])
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(unix, test))]
 fn parse_lsof(code: Option<i32>, stdout: &str, stderr: &str) -> Result<Vec<String>, String> {
     if !matches!(code, Some(0 | 1)) || !stderr.trim().is_empty() {
         return Err(format!(

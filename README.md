@@ -7,7 +7,7 @@
 ### ⚡ Разблокировка Google Antigravity & Gemini в России
 **Без VPN • Без смены страны Google-аккаунта • На полной скорости вашего интернета**
 
-[![Платформы](https://img.shields.io/badge/Платформа-Windows_10%2F11_•_macOS-0078D4.svg?style=flat-square&logo=windows&logoColor=white)](README.md)
+[![Платформы](https://img.shields.io/badge/Платформа-Windows_•_macOS_•_Linux-0078D4.svg?style=flat-square&logo=linux&logoColor=white)](README.md)
 [![Сеть](https://img.shields.io/badge/Сеть-VPN_не_нужен-2ea44f.svg?style=flat-square&logo=shield&logoColor=white)](README.md)
 [![Размер](https://img.shields.io/badge/Размер-1.08_МБ_(Rust)-8A2BE2.svg?style=flat-square&logo=rust&logoColor=white)](https://github.com/vezlin1/antigravity-bypass-russia/releases)
 [![Лицензия](https://img.shields.io/badge/Лицензия-MIT-informational.svg?style=flat-square)](LICENSE)
@@ -109,6 +109,44 @@ chmod +x scripts/unlock_and_restore.sh
 
 ---
 
+### 🐧 Linux (Ubuntu, Debian, Fedora, Arch и др.)
+
+#### Вариант 1: Быстрый запуск бинарного файла (Рекомендуется)
+1. Откройте терминал и выполните команду для скачивания и запуска готового бинарного файла:
+   ```bash
+   curl -fsSL https://github.com/vezlin1/antigravity-bypass-russia/releases/latest/download/antigravity-bypass-russia-linux-x64 -o antigravity-bypass-russia && chmod +x antigravity-bypass-russia && ./antigravity-bypass-russia
+   ```
+2. В интерактивном меню введите **`1`** (**`Полная разблокировка`**) и нажмите **Enter**.
+3. Утилита снимет региональные ограничения, настроит маршрутизацию (systemd-служба `antigravity-bypass-russia.service` и `/etc/hosts`) и сбросит кэш DNS (`resolvectl`). При необходимости запросит права суперпользователя (`sudo` / `pkexec`).
+
+#### Вариант 2: Запуск из репозитория
+<details>
+<summary><b>Инструкция для сборки из репозитория (требуется Rust)</b></summary>
+
+Установите системные зависимости (если ещё не установлены):
+```bash
+# Ubuntu / Debian
+sudo apt install build-essential pkg-config libssl-dev
+
+# Fedora
+sudo dnf install gcc pkgconf-pkg-config openssl-devel
+
+# Arch Linux
+sudo pacman -S base-devel openssl
+```
+
+Склонируйте репозиторий и запустите скрипт:
+```bash
+git clone https://github.com/vezlin1/antigravity-bypass-russia.git
+cd antigravity-bypass-russia
+chmod +x scripts/unlock_and_restore.sh
+./scripts/unlock_and_restore.sh
+```
+*(Запускайте без `sudo` — скрипт сам соберёт движок через Cargo от вашего пользователя и запросит `sudo` только при установке службы и обновлении сетевых настроек).*
+</details>
+
+---
+
 ## ⚙️ Как это работает
 
 Утилита работает точечно и полностью локально на вашем компьютере:
@@ -189,7 +227,7 @@ chmod +x scripts/unlock_and_restore.sh
 2. Выберите пункт **`6. ПОЛНЫЙ ОТКАТ`**.
 3. Программа автоматически:
    - Восстановит оригинальные файлы ядра и интерфейса из резервных копий `.bak`;
-   - Удалит записи маршрутизации (NRPT на Windows / `/etc/resolver/` на macOS);
+   - Удалит записи маршрутизации (NRPT на Windows / `/etc/resolver/` на macOS / `/etc/hosts` и systemd-сервис на Linux);
    - Сбросит системный кэш DNS и кэш сессий V8;
    - Очистит переменные окружения.
 

@@ -333,14 +333,28 @@ pub(super) fn flush_dns_cache() -> Result<(), String> {
         ("dscacheutil", &["-flushcache"]),
         ("killall", &["-HUP", "mDNSResponder"]),
     ];
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(target_os = "linux")]
+    let commands: &[(&str, &[&str])] = &[
+        ("resolvectl", &["flush-caches"]),
+    ];
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     let commands: &[(&str, &[&str])] = &[];
     let mut errors = Vec::new();
     for (program, args) in commands {
         match crate::system::command::output(program, *args) {
             Ok(out) if out.status.success() => {}
-            Ok(out) => errors.push(format!("{program}: {}", out.status)),
-            Err(error) => errors.push(format!("{program}: {error}")),
+            Ok(out) => {
+                #[cfg(not(target_os = "linux"))]
+                errors.push(format!("{program}: {}", out.status));
+                #[cfg(target_os = "linux")]
+                let _ = out;
+            }
+            Err(error) => {
+                #[cfg(not(target_os = "linux"))]
+                errors.push(format!("{program}: {error}"));
+                #[cfg(target_os = "linux")]
+                let _ = error;
+            }
         }
     }
     if errors.is_empty() {
@@ -586,7 +600,7 @@ pub fn apply_dns_rules() -> Result<NetworkSetup, String> {
     }
     let mut relay_ok = false;
     let mut relay_note = String::new();
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
     {
         step("Запускаем DNS-обход");
         match crate::system::service::enable() {
@@ -691,6 +705,8 @@ pub fn apply_dns_rules() -> Result<NetworkSetup, String> {
         format!("Сеть настроена (релей {}:{})", LISTEN_IP, LISTEN_PORT)
     } else if cfg!(target_os = "macos") {
         "Сеть настроена (/etc/resolver, без фона)".to_string()
+    } else if cfg!(target_os = "linux") {
+        "Сеть настроена (hosts)".to_string()
     } else if relay_note.is_empty() {
         "Сеть настроена".to_string()
     } else {
