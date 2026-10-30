@@ -59,6 +59,10 @@ fn main() {
         println!("antigravity-bypass-russia v{}", env!("CARGO_PKG_VERSION"));
         return;
     }
+    if command.is_empty() && args.len() > 1 {
+        eprintln!("Лишние аргументы. См. --help");
+        std::process::exit(2);
+    }
     if !matches!(
         command,
         "" | "status"

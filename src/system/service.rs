@@ -478,6 +478,10 @@ pub fn enable() -> Result<(), String> {
         {
             unload_mac_job()?;
         }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            let _ = crate::system::command::output("systemctl", ["stop", SYSTEMD_LABEL]);
+        }
 
         crate::system::process::stop_process_by_name(EXE_NAME);
 
@@ -661,6 +665,7 @@ pub fn enable() -> Result<(), String> {
         ) {
             let _ = crate::system::command::output("systemctl", ["daemon-reload"]);
             let _ = crate::system::command::output("systemctl", ["enable", "--now", SYSTEMD_LABEL]);
+            let _ = crate::system::command::output("systemctl", ["restart", SYSTEMD_LABEL]);
         } else {
             let _ = std::process::Command::new(&dst)
                 .arg(FORWARDER_FLAG)

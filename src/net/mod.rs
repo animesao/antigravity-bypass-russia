@@ -336,13 +336,17 @@ pub(super) fn flush_dns_cache() -> Result<(), String> {
     #[cfg(target_os = "linux")]
     let commands: &[(&str, &[&str])] = &[
         ("resolvectl", &["flush-caches"]),
+        ("systemd-resolve", &["--flush-caches"]),
     ];
     #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     let commands: &[(&str, &[&str])] = &[];
     let mut errors: Vec<String> = Vec::new();
     for (program, args) in commands {
         match crate::system::command::output(program, *args) {
-            Ok(out) if out.status.success() => {}
+            Ok(out) if out.status.success() => {
+                #[cfg(target_os = "linux")]
+                return Ok(());
+            }
             Ok(out) => {
                 #[cfg(not(target_os = "linux"))]
                 errors.push(format!("{program}: {}", out.status));
