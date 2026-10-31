@@ -301,10 +301,22 @@ fn query(paths: &[PathBuf]) -> Result<Vec<String>, String> {
 
 #[cfg(any(unix, test))]
 fn parse_lsof(code: Option<i32>, stdout: &str, stderr: &str) -> Result<Vec<String>, String> {
-    if !matches!(code, Some(0 | 1)) || !stderr.trim().is_empty() {
+    // Desktop Linux lsof always warns on stderr about unreachable FUSE mounts
+    // (GVFS/portal) while still reporting the requested files; code 1 plus only
+    // those warnings means the check itself succeeded.
+    let errors: Vec<&str> = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            !line.is_empty()
+                && !line.starts_with("lsof: WARNING:")
+                && !line.starts_with("Output information may be incomplete.")
+        })
+        .collect();
+    if !matches!(code, Some(0 | 1)) || !errors.is_empty() {
         return Err(format!(
             "Проверка открытых файлов: код {code:?}; {}",
-            stderr.trim()
+            errors.join("\n")
         ));
     }
     let mut result = Vec::new();
@@ -441,6 +453,28 @@ mod mac_lock_tests {
         assert!(super::parse_lsof(Some(1), "", "").unwrap().is_empty());
         assert!(super::parse_lsof(Some(1), "", "permission denied").is_err());
         assert!(super::parse_lsof(Some(0), "unexpected output", "").is_err());
+        // Desktop Linux (GVFS/portal) prints these warnings on every run.
+        assert_eq!(
+            super::parse_lsof(
+                Some(1),
+                "",
+                "lsof: WARNING: can't stat() fuse.portal file system /run/user/1000/doc\n\
+                 Output information may be incomplete.\n\
+                 lsof: WARNING: can't stat() fuse.gvfsd-fuse file system /run/user/1000/gvfs\n\
+                 Output information may be incomplete."
+            )
+            .unwrap()
+            .len(),
+            0
+        );
+        // A real failure after the warnings is still an error.
+        assert!(super::parse_lsof(
+            Some(1),
+            "",
+            "lsof: WARNING: can't stat() fuse.gvfsd-fuse file system /run/user/1000/gvfs\n\
+             lsof: fatal: permission denied"
+        )
+        .is_err());
     }
 
     #[cfg(target_os = "macos")]
